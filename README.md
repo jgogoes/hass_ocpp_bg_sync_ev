@@ -5,6 +5,8 @@
 
 ![OCPP](https://github.com/home-assistant/brands/raw/master/custom_integrations/ocpp/icon.png)
 
+** This is a fork to attempt to work with and unlock BG Sync EV charger **
+
 This is a Home Assistant integration for Electric Vehicle chargers that support the following Open Charge Point Protocols 1.6j, 2.0.1 and 2.1 (experimental).
 
 * based on the [Python OCPP Package](https://github.com/mobilityhouse/ocpp).
