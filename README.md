@@ -1,21 +1,65 @@
 [![hacs_badge](https://img.shields.io/badge/HACS-Default-orange.svg)](https://github.com/custom-components/hacs)
-[![codecov](https://codecov.io/gh/lbbrhzn/ocpp/branch/main/graph/badge.svg?token=3FRJIF5KRW)](https://codecov.io/gh/lbbrhzn/ocpp)
-[![Documentation Status](https://readthedocs.org/projects/home-assistant-ocpp/badge/?version=latest)](https://home-assistant-ocpp.readthedocs.io/en/latest/?badge=latest)
-[![hacs_downloads](https://img.shields.io/github/downloads/lbbrhzn/ocpp/latest/total)](https://github.com/lbbrhzn/ocpp/releases/latest)
+[![Device Custom](https://img.shields.io/badge/Branch-device--custom-blue.svg)](https://github.com/jgogoes/hass_ocpp_bg_sync_ev/tree/device-custom)
 
 ![OCPP](https://github.com/home-assistant/brands/raw/master/custom_integrations/ocpp/icon.png)
 
-** This is a fork to attempt to work with and unlock BG Sync EV charger **
+# OCPP Integration for Home Assistant - BG Sync EV Customization
 
-This is a Home Assistant integration for Electric Vehicle chargers that support the following Open Charge Point Protocols 1.6j, 2.0.1 and 2.1 (experimental).
+> **Device-specific fork optimized for BG Sync EV chargers**
 
-* based on the [Python OCPP Package](https://github.com/mobilityhouse/ocpp).
-* HACS compliant repository 
+This is a **customized branch** of the excellent [Home Assistant OCPP integration](https://github.com/lbbrhzn/ocpp) with enhancements tailored specifically for **BG Sync EV chargers**.
 
-Documentation can be found here [home-assistant-ocpp.readthedocs.io](https://home-assistant-ocpp.readthedocs.io)
+## 🎯 About This Fork
 
-**💡 Tip:** If you like this project consider buying me a coffee or a cocktail:
+This branch maintains full compatibility with the original project while adding device-specific optimizations:
 
-<a href="https://www.buymeacoffee.com/lbbrhzn" target="_blank">
-  <img src="https://cdn.buymeacoffee.com/buttons/default-black.png" alt="Buy Me A Coffee" width="150px">
-</a>
+✨ **What's Different:**
+- Enhanced switch state stability (fixes permanent stuck states after Home Assistant restart)
+- Optimized CT clamp entity handling and sensor updates
+- Improved data transfer notifications to Home Assistant
+- Streamlined Local Authorization List configuration
+- Better compatibility with BG Sync EV charger protocol variations
+
+## 📦 Installation
+
+Clone this specific branch:
+
+```bash
+git clone --branch device-custom https://github.com/jgogoes/hass_ocpp_bg_sync_ev.git
+# Then copy custom_components/ocpp to your Home Assistant custom_components directory
+```
+
+Or via HACS (if enabled for this repo).
+
+## 🔄 Staying Updated
+
+This branch automatically merges updates from the [original project](https://github.com/lbbrhzn/ocpp), so you get:
+- Latest bug fixes
+- New OCPP protocol support
+- Community improvements
+- Plus your BG Sync optimizations
+
+## 📚 Documentation
+
+For full documentation on OCPP integration features, see:
+- [Original Project Docs](https://home-assistant-ocpp.readthedocs.io)
+- [Python OCPP Package](https://github.com/mobilityhouse/ocpp)
+
+## 🙏 Credits
+
+**This work builds on:**
+- The incredible [OCPP integration](https://github.com/lbbrhzn/ocpp) by [lbbrhzn](https://github.com/lbbrhzn)
+- The [Python OCPP Package](https://github.com/mobilityhouse/ocpp) by Mobility House
+- Home Assistant's amazing smart home platform
+
+**Special thanks** to the original maintainers for creating such a solid foundation. This fork would not exist without their excellent work.
+
+## 💪 Support
+
+- **For BG Sync-specific issues:** Use this repository's issues
+- **For general OCPP questions:** Check the [original project](https://github.com/lbbrhzn/ocpp)
+- **To support the original author:** Consider [buying them a coffee](https://www.buymeacoffee.com/lbbrhzn) ☕
+
+## 📄 License
+
+This project maintains the same license as the original OCPP integration. See LICENSE file for details.
