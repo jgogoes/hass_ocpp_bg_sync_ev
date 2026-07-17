@@ -32,8 +32,9 @@ This branch **builds on top of** the original integration with device-specific i
   - Protects against accidental disconnection during charging
   - Require explicit Home Assistant confirmation to release cable
 - **Brightness Control** — Adjust outdoor charger port LED brightness for visual feedback
-  - Perfect for automations: 1% brightness at dusk, 30% at dawn, etc.
-  - Create custom lighting scenes based on charging status
+  - *Requires Home Assistant automation to control* (e.g., 1% at dusk, 30% at dawn)
+  - Integration provides the control, you create the automations
+  - Example: Automate brightness based on time, solar production, or charging status
 - **Solar Charging Ready** — Reliable integration with EVCC for solar-powered EV charging
   - Consistent power monitoring for grid-aware charging
   - Real-time house current monitoring via CT clamp
