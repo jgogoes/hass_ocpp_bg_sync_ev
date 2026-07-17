@@ -1,6 +1,7 @@
 """Representation of a OCPP 1.6 charging station."""
 
 from datetime import datetime, timedelta, UTC
+import json
 import logging
 
 import time
@@ -33,6 +34,7 @@ from ocpp.v16.enums import (
     ResetStatus,
     ResetType,
     TriggerMessageStatus,
+    UnitOfMeasure,
     UnlockStatus,
 )
 
@@ -55,9 +57,11 @@ from .enums import (
 from .const import (
     CentralSystemSettings,
     ChargerSystemSettings,
+    DEFAULT_LIGHT_INTENSITY,
     DEFAULT_MEASURAND,
     HA_ENERGY_UNIT,
     MEASURANDS,
+    SYNCEV_VENDOR_KEY_MODELS,
 )
 
 _LOGGER: logging.Logger = logging.getLogger(__package__)
@@ -280,10 +284,34 @@ class ChargePoint(cp):
             ckey.meter_value_sample_interval.value,
             str(self.settings.meter_interval),
         )
+        # This charger (SyncEV EVSC7S) reports ClockAlignedDataInterval as
+        # read-only, so don't raise a persistent HA notification for it on
+        # every restart — just log at debug level.
         await self.configure(
             ckey.clock_aligned_data_interval.value,
             str(self.settings.idle_interval),
+            notify_on_readonly=False,
         )
+        # SyncEV EVSC7S resets its indicator LED to a bright default on
+        # every power-cycle/reboot. LightIntensity is a standard OCPP key
+        # (0-100, % of max brightness) but this charger omits it from its
+        # default GetConfiguration dump — confirmed supported and writable
+        # only when queried/set by name. Reassert a sensible fixed default
+        # on every connect (charger reboots are rare, and the day/night
+        # automation self-corrects at the next sunrise/sunset regardless).
+        # Only attempted on models where this vendor behaviour is confirmed
+        # or expected (see SYNCEV_VENDOR_KEY_MODELS in const.py) — other OCPP
+        # chargers may not have this key at all.
+        model = self._metrics.get((0, cdet.model.value))
+        model_value = model.value if model is not None else None
+        if model_value in SYNCEV_VENDOR_KEY_MODELS:
+            try:
+                await self.configure(
+                    ckey.light_intensity.value,
+                    str(DEFAULT_LIGHT_INTENSITY),
+                )
+            except Exception as ex:
+                _LOGGER.debug("Failed to reassert LightIntensity on connect: %s", ex)
 
     async def get_supported_features(self) -> prof:
         """Get features supported by the charger."""
@@ -443,22 +471,27 @@ class ChargePoint(cp):
             units_resp = om.current.value
 
         use_amps = om.current.value in units_resp
-        limit_value = float(limit_amps if use_amps else limit_watts)
+        # Round to 1 decimal place: OCPP schema enforces multipleOf 0.1 on
+        # chargingSchedulePeriod[].limit, and full float precision (e.g.
+        # 11.653986956521738) gets rejected locally before it ever reaches
+        # the charger.
+        limit_value = round(float(limit_amps if use_amps else limit_watts), 1)
         units_value = (
             ChargingRateUnitType.amps.value
             if use_amps
             else ChargingRateUnitType.watts.value
         )
 
-        try:
-            stack_level_resp = await self.get_configuration(
-                ckey.charge_profile_max_stack_level.value
-            )
-            stack_level = int(stack_level_resp)
-        except Exception:
-            stack_level = 1
+        # NOTE: We deliberately do NOT use the charger-reported
+        # ChargeProfileMaxStackLevel as the level to send. Some chargers
+        # (confirmed on the SL320S647) advertise a higher max than they
+        # actually accept and reject SetChargingProfile with NotSupported
+        # at elevated stack levels, even though the same profile (purpose,
+        # kind, schedule) is Accepted at stackLevel 0. Always use the
+        # lowest stack level per purpose, which is verified to work.
+        stack_level = 0
 
-        # Helper to build a simple relative schedule with one period
+        # Helper to build a simple single-period schedule
         def _mk_schedule(_units: str, _limit: float) -> dict:
             return {
                 om.charging_rate_unit.value: _units,
@@ -481,6 +514,15 @@ class ChargePoint(cp):
             return base + max(0, n)
 
         # Try ChargePointMaxProfile (connectorId = 0)
+        # NOTE: this is only the overall safety ceiling. It does NOT
+        # override a lower TxDefaultProfile/TxProfile that may already be
+        # active from a previous call (e.g. EVCC's last update). We must
+        # NOT return early here - every call has to refresh all three
+        # profile types below, otherwise a stale low TxDefaultProfile can
+        # silently keep capping the session indefinitely even after the
+        # ceiling is raised. (This was the root cause of charging getting
+        # stuck at ~10-12A regardless of the requested limit.)
+        cpmp_ok = False
         try:
             req = call.SetChargingProfile(
                 connector_id=0,
@@ -489,18 +531,22 @@ class ChargePoint(cp):
                         ChargingProfilePurposeType.charge_point_max_profile.value, 0
                     ),
                     om.stack_level.value: stack_level,
-                    om.charging_profile_kind.value: ChargingProfileKindType.relative.value,
+                    # Absolute, not Relative: this charger (and others, see
+                    # lbbrhzn/ocpp#1565) reject Relative-kind profiles with
+                    # PropertyConstraintViolation/NotSupported. Absolute is
+                    # valid for an immediate, unconditional limit.
+                    om.charging_profile_kind.value: ChargingProfileKindType.absolute.value,
                     om.charging_profile_purpose.value: ChargingProfilePurposeType.charge_point_max_profile.value,
                     om.charging_schedule.value: _mk_schedule(units_value, limit_value),
                 },
             )
             resp = await self.call(req)
-            if resp.status == ChargingProfileStatus.accepted:
-                return True
-            _LOGGER.debug(
-                "ChargePointMaxProfile not accepted (%s); will continue.",
-                resp.status,
-            )
+            cpmp_ok = resp.status == ChargingProfileStatus.accepted
+            if not cpmp_ok:
+                _LOGGER.debug(
+                    "ChargePointMaxProfile not accepted (%s); will continue.",
+                    resp.status,
+                )
         except Exception as ex:
             _LOGGER.debug("ChargePointMaxProfile call raised: %s", ex)
 
@@ -519,7 +565,7 @@ class ChargePoint(cp):
         # If an active transaction exists on this connector, try TxProfile first (affects ongoing charging)
         if active_tx_id > 0:
             try:
-                txp_stack = max(1, stack_level)  # keep same or higher than defaults
+                txp_stack = stack_level  # verified-working level (0)
                 req = call.SetChargingProfile(
                     connector_id=target_cid,
                     cs_charging_profiles={
@@ -527,7 +573,7 @@ class ChargePoint(cp):
                             ChargingProfilePurposeType.tx_profile.value, target_cid
                         ),
                         om.stack_level.value: txp_stack,
-                        om.charging_profile_kind.value: ChargingProfileKindType.relative.value,
+                        om.charging_profile_kind.value: ChargingProfileKindType.absolute.value,
                         om.charging_profile_purpose.value: ChargingProfilePurposeType.tx_profile.value,
                         om.charging_schedule.value: _mk_schedule(
                             units_value, limit_value
@@ -546,9 +592,7 @@ class ChargePoint(cp):
 
         # Always attempt TxDefaultProfile as well (for future sessions)
         try:
-            tx_stack = max(
-                1, stack_level - 1
-            )  # slightly lower to avoid overriding TxProfile
+            tx_stack = stack_level  # verified-working level (0)
             req = call.SetChargingProfile(
                 connector_id=target_cid,
                 cs_charging_profiles={
@@ -556,7 +600,7 @@ class ChargePoint(cp):
                         ChargingProfilePurposeType.tx_default_profile.value, target_cid
                     ),
                     om.stack_level.value: tx_stack,
-                    om.charging_profile_kind.value: ChargingProfileKindType.relative.value,
+                    om.charging_profile_kind.value: ChargingProfileKindType.absolute.value,
                     om.charging_profile_purpose.value: ChargingProfilePurposeType.tx_default_profile.value,
                     om.charging_schedule.value: _mk_schedule(units_value, limit_value),
                 },
@@ -577,7 +621,7 @@ class ChargePoint(cp):
                     f"Note: Active TxProfile applied, but TxDefaultProfile failed: {ex}"
                 )
 
-        return bool(txp_ok or txd_ok)
+        return bool(cpmp_ok or txp_ok or txd_ok)
 
     async def set_availability(self, state: bool = True, connector_id: int | None = 0):
         """Change availability."""
@@ -839,7 +883,7 @@ class ChargePoint(cp):
             await self.notify_ha(f"Warning: charger reports {key} is unknown")
             return "Unknown"
 
-    async def configure(self, key: str, value: str):
+    async def configure(self, key: str, value: str, notify_on_readonly: bool = True):
         """Configure charger by setting the key to target value.
 
         First the configuration key is read using GetConfiguration. The key's
@@ -848,6 +892,9 @@ class ChargePoint(cp):
 
         If the key has a different value a ChangeConfiguration request is issued.
 
+        notify_on_readonly: set False for keys known to be read-only on this
+        charger so we don't spam a persistent notification every time it's
+        called (e.g. during set_standard_configuration on every restart).
         """
         req = call.GetConfiguration(key=[key])
 
@@ -865,8 +912,10 @@ class ChargePoint(cp):
                 return
 
             if key_value.get(om.readonly.name, False):
-                _LOGGER.warning("%s is a read only setting", key)
-                await self.notify_ha(f"Warning: {key} is read-only")
+                _LOGGER.debug("%s is a read only setting", key)
+                if notify_on_readonly:
+                    await self.notify_ha(f"Warning: {key} is read-only")
+                return
 
         req = call.ChangeConfiguration(key=key, value=value)
 
@@ -1055,14 +1104,34 @@ class ChargePoint(cp):
     def on_status_notification(self, connector_id, error_code, status, **kwargs):
         """Handle a status notification."""
 
+        # Some chargers (e.g. SyncEV) include vendor-specific fault detail
+        # (vendorId/vendorErrorCode) and/or free-text info alongside the
+        # standard OCPP errorCode. Upstream OCPP discards these — surface
+        # them as extra attributes on the error-code sensor so a fault like
+        # errorCode=OtherError, vendorErrorCode="CP abnormal" is visible in
+        # HA without needing debug logging.
+        fault_detail = {
+            k: v
+            for k, v in {
+                "vendor_id": kwargs.get(om.vendor_id.name),
+                "vendor_error_code": kwargs.get(om.vendor_error_code.name),
+                "info": kwargs.get(om.info.name),
+            }.items()
+            if v
+        }
+
         if connector_id == 0 or connector_id is None:
             self._metrics[(0, cstat.status.value)].value = status
             self._metrics[(0, cstat.error_code.value)].value = error_code
+            self._metrics[(0, cstat.error_code.value)].extra_attr = fault_detail
         else:
             self._metrics[(connector_id, cstat.status_connector.value)].value = status
             self._metrics[
                 (connector_id, cstat.error_code_connector.value)
             ].value = error_code
+            self._metrics[
+                (connector_id, cstat.error_code_connector.value)
+            ].extra_attr = fault_detail
 
             if status in (
                 ChargePointStatus.suspended_ev.value,
@@ -1223,6 +1292,51 @@ class ChargePoint(cp):
         _LOGGER.debug("Data transfer received from %s: %s", self.id, kwargs)
         self._metrics[0][cdet.data_transfer.value].value = datetime.now(tz=UTC)
         self._metrics[0][cdet.data_transfer.value].extra_attr = {vendor_id: kwargs}
+
+        # SyncEV-specific: the charger spontaneously pushes a DataTransfer with
+        # vendor_id "energy.sync" / message_id "GetCTClampValue" containing a CT
+        # clamp current+voltage reading as a JSON string, e.g.
+        # {"current":15050,"voltage":238200} (milliamps/millivolts). Surface
+        # this as proper sensors instead of leaving it buried in extra_attr.
+        if vendor_id == "energy.sync" and kwargs.get("message_id") == "GetCTClampValue":
+            try:
+                payload = json.loads(kwargs.get("data") or "{}")
+            except (TypeError, ValueError) as ex:
+                _LOGGER.debug("Could not parse GetCTClampValue payload: %s", ex)
+                payload = {}
+
+            current_ma = payload.get("current")
+            if current_ma is not None:
+                try:
+                    self._metrics[0][cdet.ct_clamp_current.value].value = round(
+                        float(current_ma) / 1000, 2
+                    )
+                    self._metrics[0][cdet.ct_clamp_current.value].unit = (
+                        UnitOfMeasure.a.value
+                    )
+                except (TypeError, ValueError):
+                    _LOGGER.debug("Non-numeric CT clamp current: %s", current_ma)
+
+            voltage_mv = payload.get("voltage")
+            if voltage_mv is not None:
+                try:
+                    self._metrics[0][cdet.ct_clamp_voltage.value].value = round(
+                        float(voltage_mv) / 1000, 1
+                    )
+                    self._metrics[0][cdet.ct_clamp_voltage.value].unit = (
+                        UnitOfMeasure.v.value
+                    )
+                except (TypeError, ValueError):
+                    _LOGGER.debug("Non-numeric CT clamp voltage: %s", voltage_mv)
+
+            # Without this, the CT clamp metrics above are updated in memory
+            # but the sensor entities are never told to refresh — they'd sit
+            # frozen until some unrelated handler (MeterValues, Heartbeat,
+            # StatusNotification) happened to fire its own update() call.
+            # Confirmed via live test 2026-07-07: readings were arriving and
+            # being stored correctly the whole time, just never displayed.
+            self.hass.async_create_task(self.update(self.settings.cpid))
+
         return call_result.DataTransfer(status=DataTransferStatus.accepted.value)
 
     @on(Action.heartbeat)

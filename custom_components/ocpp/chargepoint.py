@@ -346,19 +346,37 @@ class ChargePoint(cp):
             # if an entry differs this will unload/reload and stop/restart the central system/websocket
             self.hass.config_entries.async_update_entry(self.entry, data=updated_entry)
 
-            await self.set_standard_configuration()
+            # set_standard_configuration sends GetConfiguration/ChangeConfiguration to
+            # the charger. Some chargers (e.g. SyncEV) are slow to respond and time out,
+            # which previously aborted post_connect and left post_connect_success=False,
+            # causing a retry loop. Isolate it so a timeout here is non-fatal.
+            try:
+                await self.set_standard_configuration()
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:
+                _LOGGER.debug("post_connect: set_standard_configuration failed non-fatally: %s", ex)
 
             self.post_connect_success = True
             _LOGGER.debug("'%s' post connection setup completed successfully", self.id)
 
             # nice to have, but not needed for integration to function
-            # and can cause issues with some chargers
-            try:
-                await self.set_availability()
-            except asyncio.CancelledError:
-                raise
-            except Exception as ex:
-                _LOGGER.debug("post_connect: set_availability ignored error: %s", ex)
+            # and can cause issues with some chargers.
+            # Skip entirely if a transaction is already active: sending ChangeAvailability
+            # mid-session toggles the CP signal and causes spurious wake-up faults on
+            # some EVs (e.g. VW ID.3 C1249 "Too Many Wake-Up Requests").
+            if self.active_transaction_id == 0:
+                try:
+                    await self.set_availability()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as ex:
+                    _LOGGER.debug("post_connect: set_availability ignored error: %s", ex)
+            else:
+                _LOGGER.debug(
+                    "post_connect: skipping set_availability — active transaction %s",
+                    self.active_transaction_id,
+                )
 
             if prof.REM in self._attr_supported_features:
                 if self.received_boot_notification is False:

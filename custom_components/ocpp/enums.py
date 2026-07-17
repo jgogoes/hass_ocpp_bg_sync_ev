@@ -51,6 +51,8 @@ class HAChargerDetails(str, Enum):
     data_response = "Timestamp.Data.Response"
     data_transfer = "Timestamp.Data.Transfer"
     config_response = "Timestamp.Config.Response"
+    ct_clamp_current = "Current.CtClamp"
+    ct_clamp_voltage = "Voltage.CtClamp"
 
 
 class HAChargerSession(str, Enum):
@@ -116,6 +118,9 @@ class OcppMisc(str, Enum):
     feature_profile_remote = "RemoteTrigger"
     feature_profile_auth = "LocalAuthListManagement"
     tech_info = "techInfo"
+    vendor_id = "vendorId"
+    vendor_error_code = "vendorErrorCode"
+    info = "info"
 
     # for use with Smart Charging
     current = "Current"

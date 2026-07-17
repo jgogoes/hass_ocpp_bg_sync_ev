@@ -57,7 +57,39 @@ DEFAULT_SUBPROTOCOLS = ["ocpp1.6", "ocpp2.0.1", "ocpp2.1"]
 OCPP_2_0 = "ocpp2"
 DEFAULT_METER_INTERVAL = 60
 DEFAULT_IDLE_INTERVAL = 900
+# SyncEV EVSC7S (and possibly other SyncEV models) resets its indicator LED
+# to a bright default on every power-cycle/reboot. LightIntensity is a
+# standard OCPP key (0-100, percentage of max brightness per spec) but this
+# charger omits it from its default GetConfiguration dump — it must be
+# queried/set by name explicitly. Reasserted on every post_connect (a fixed
+# default — reboots are rare, and the day/night automation self-corrects at
+# the next sunrise/sunset regardless) so it survives charger reboots, not
+# just HA restarts. 100 (full brightness) chosen as the safer fallback.
+DEFAULT_LIGHT_INTENSITY = 100
 DEFAULT_WEBSOCKET_CLOSE_TIMEOUT = 10
+
+# charge_point_model strings (as reported in BootNotification, exposed via
+# sensor.<cpid>_model) on which the vendor-proprietary LightIntensity-reassert
+# behaviour and the ChargerMode ("Charge When Plugged In") switch have been
+# confirmed to apply. These are all Sync Energy / "Link" branded EV chargers.
+# EVSC7S was confirmed directly on real hardware (2026-07-07); the rest are
+# other models in the same vendor range and share the same OCPP config-key
+# vocabulary, but have not been individually live-tested for these two
+# specific keys — verify on your own unit before relying on them if your
+# model isn't EVSC7S. Other integration features (multi-connector handling,
+# CT clamp support, etc.) are NOT gated by this list — they're standard OCPP
+# behaviour expected to work across any compliant charger.
+SYNCEV_VENDOR_KEY_MODELS = [
+    "EVSC7S",
+    "EVL7PS",
+    "EVL7PSG",
+    "EVL7MS",
+    "EVL7MSG",
+    "EVLR7MS",
+    "EVLR7MSG",
+    "EVLS7MS",
+    "EVLS7MSG",
+]
 DEFAULT_WEBSOCKET_PING_TRIES = 2
 DEFAULT_WEBSOCKET_PING_INTERVAL = 20
 DEFAULT_WEBSOCKET_PING_TIMEOUT = 20

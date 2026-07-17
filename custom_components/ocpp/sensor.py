@@ -33,6 +33,68 @@ from .const import (
 )
 from .enums import HAChargerDetails, HAChargerSession, HAChargerStatuses
 
+# Friendlier display names for sensors whose default name is just the raw
+# OCPP metric/measurand string (e.g. "Current.Import" -> "Current Import").
+# Keyed on the exact metric value (dots, original case) as passed to
+# _mk_desc(); anything not listed here falls back to the old auto-generated
+# "dots replaced with spaces" behaviour.
+SENSOR_NAME_OVERRIDES = {
+    "Status": "Charger Status",
+    "Status.Firmware": "Firmware Update Status",
+    "Heartbeat": "Last Heartbeat",
+    "Id.Tag": "Active ID Tag",
+    "Latency.Ping": "Ping Latency",
+    "Latency.Pong": "Pong Latency",
+    "Reconnects": "Reconnect Count",
+    "ID": "OCPP Charge Point ID",
+    "Vendor": "Manufacturer",
+    "Serial": "Serial Number",
+    "Version.Firmware": "Firmware Version",
+    "Features": "Supported Features",
+    "Connectors": "Connector Count",
+    "Timestamp.Config.Response": "Last Config Response",
+    "Timestamp.Data.Response": "Last Data Response",
+    "Timestamp.Data.Transfer": "Last Data Transfer",
+    "Current.Import": "Charging Current",
+    "Current.Offered": "Max Current Offered to EV",
+    "Energy.Active.Import.Register": "Lifetime Energy Delivered",
+    "Power.Active.Import": "Charging Power",
+    "Temperature": "Charger Temperature",
+    "Voltage": "Mains Voltage",
+    "Current.CtClamp": "House Current (CT Clamp)",
+    "Voltage.CtClamp": "House Voltage (CT Clamp)",
+    "Status.Connector": "Connector Status",
+    "Error.Code.Connector": "Connector Error Code",
+    "Stop.Reason": "Last Stop Reason",
+    "Transaction.Id": "Transaction ID",
+    "Time.Session": "Session Duration",
+    "Energy.Meter.Start": "Meter Reading at Session Start",
+}
+
+# Metrics observed to never report a real value on this charger/vehicle
+# combination (always "unknown" or "unavailable"). Disabled by default to
+# keep the dashboard tidy, but they can be re-enabled per-entity in the HA UI
+# if a different vehicle or firmware starts reporting them.
+DISABLED_BY_DEFAULT_METRICS = {
+    HAChargerStatuses.firmware_status.value.lower(),  # Status.Firmware - charger never sends FirmwareStatusNotification
+    "current.export",  # export/V2G not supported by this charger
+    "power.active.export",
+    "power.reactive.export",
+    "power.reactive.import",  # no reactive power measurement reported
+    "soc",  # vehicle does not report State of Charge over OCPP
+    "energy.active.export.interval",
+    "energy.active.export.register",
+    "energy.active.import.interval",
+    "energy.reactive.export.interval",
+    "energy.reactive.export.register",
+    "energy.reactive.import.interval",
+    "energy.reactive.import.register",
+    "frequency",  # charger does not report mains frequency
+    "power.factor",
+    "power.offered",
+    "rpm",
+}
+
 
 @dataclass
 class OcppSensorDescription(SensorEntityDescription):
@@ -73,48 +135,59 @@ async def async_setup_entry(hass, entry, async_add_devices):
         measurands = sorted(configured or default_measurands)
 
         CHARGER_ONLY = [
-            HAChargerStatuses.status.value,
-            HAChargerStatuses.error_code.value,
-            HAChargerStatuses.firmware_status.value,
-            HAChargerStatuses.heartbeat.value,
-            HAChargerStatuses.id_tag.value,
-            HAChargerStatuses.latency_ping.value,
-            HAChargerStatuses.latency_pong.value,
-            HAChargerStatuses.reconnects.value,
+            # Nameplate / identity
             HAChargerDetails.identifier.value,
             HAChargerDetails.vendor.value,
             HAChargerDetails.model.value,
             HAChargerDetails.serial.value,
             HAChargerDetails.firmware_version.value,
-            HAChargerDetails.features.value,
             HAChargerDetails.connectors.value,
+            HAChargerDetails.features.value,
+            # Live connection health
+            HAChargerStatuses.status.value,
+            HAChargerStatuses.error_code.value,
+            HAChargerStatuses.firmware_status.value,
+            HAChargerStatuses.heartbeat.value,
+            HAChargerStatuses.latency_ping.value,
+            HAChargerStatuses.latency_pong.value,
+            HAChargerStatuses.reconnects.value,
+            HAChargerStatuses.id_tag.value,
+            # Supply-side live measurements (CT clamp)
+            HAChargerDetails.ct_clamp_current.value,
+            HAChargerDetails.ct_clamp_voltage.value,
+            # Diagnostic timestamps
             HAChargerDetails.config_response.value,
             HAChargerDetails.data_response.value,
             HAChargerDetails.data_transfer.value,
         ]
 
         CONNECTOR_ONLY = measurands + [
+            # Live connector state
             HAChargerStatuses.status_connector.value,
             HAChargerStatuses.error_code_connector.value,
-            HAChargerStatuses.stop_reason.value,
+            # Session lifecycle, in chronological order, ending with the
+            # outcome (stop reason)
             HAChargerSession.transaction_id.value,
             HAChargerSession.session_time.value,
             HAChargerSession.session_energy.value,
             HAChargerSession.meter_start.value,
+            HAChargerStatuses.stop_reason.value,
         ]
 
         def _mk_desc(metric: str, *, cat_diag: bool = False) -> OcppSensorDescription:
             ms = str(metric).strip()
             return OcppSensorDescription(
                 key=ms.lower().replace(".", "_"),
-                name=ms.replace(".", " "),
+                name=SENSOR_NAME_OVERRIDES.get(ms, ms.replace(".", " ")),
                 metric=ms,
                 entity_category=EntityCategory.DIAGNOSTIC if cat_diag else None,
+                entity_registry_enabled_default=ms.lower()
+                not in DISABLED_BY_DEFAULT_METRICS,
             )
 
         def _uid(cpid: str, key: str, connector_id: int | None) -> str:
             """Mirror ChargePointMetric unique_id construction."""
-            key = key.lower()
+            key = key.lower().replace(".", "_")
             parts = [DOMAIN, cpid, key, SENSOR_DOMAIN]
             if connector_id is not None:
                 parts.insert(2, f"conn{connector_id}")
@@ -126,6 +199,22 @@ async def async_setup_entry(hass, entry, async_add_devices):
                 stale_eid = ent_reg.async_get_entity_id(SENSOR_DOMAIN, DOMAIN, uid)
                 if stale_eid:
                     # Remove the old entity so it doesn't linger as 'unavailable'
+                    ent_reg.async_remove(stale_eid)
+        else:
+            # Confirmed via live GetConfiguration (MeterValuesSampledData) on
+            # SL320S647 (2026-07-07) that these measurands are never sampled
+            # by this charger, and history showed a single 'unavailable'
+            # state since entity creation with no other value ever recorded.
+            # They're already flagged in DISABLED_BY_DEFAULT_METRICS so any
+            # freshly (re)created entity registers disabled-by-default —
+            # this just clears out the old enabled/unavailable registrations
+            # so they don't linger on the dashboard.
+            for metric_key in DISABLED_BY_DEFAULT_METRICS:
+                if metric_key == HAChargerStatuses.firmware_status.value.lower():
+                    continue  # reports 'unknown', not 'unavailable' — may still populate
+                uid = _uid(cpid, metric_key, connector_id=None)
+                stale_eid = ent_reg.async_get_entity_id(SENSOR_DOMAIN, DOMAIN, uid)
+                if stale_eid:
                     ent_reg.async_remove(stale_eid)
 
         # Root/charger-entities
