@@ -91,11 +91,22 @@ For full documentation on OCPP integration features, see:
 
 **Special thanks** to the original maintainers for creating such a solid foundation. This fork would not exist without their excellent work.
 
-## 💪 Support
+## 💪 Support & Community
 
-- **For BG Sync-specific issues:** Use this repository's issues
-- **For general OCPP questions:** Check the [original project](https://github.com/lbbrhzn/ocpp)
-- **To support the original author:** Consider [buying them a coffee](https://www.buymeacoffee.com/lbbrhzn) ☕
+**Have questions or issues?**
+
+- 🐛 **Bug Reports** — [Open an Issue](https://github.com/jgogoes/hass_ocpp_bg_sync_ev/issues)
+  - Integration not working with your charger?
+  - Found a bug or unexpected behavior?
+  
+- 💬 **Questions & Setup Help** — [Start a Discussion](https://github.com/jgogoes/hass_ocpp_bg_sync_ev/discussions)
+  - How do I configure X?
+  - How do I set up automations?
+  - Help with troubleshooting
+
+- 📖 **General OCPP Questions** — Check the [original project](https://github.com/lbbrhzn/ocpp)
+
+- ☕ **Support the Original Author** — [Buy them a coffee](https://www.buymeacoffee.com/lbbrhzn)
 
 ## 📄 License
 
