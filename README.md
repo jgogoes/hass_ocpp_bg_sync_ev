@@ -15,20 +15,25 @@ This is a **customized version** of the [original OCPP integration by lbbrhzn](h
 - **Who it's for:** Users with **BG Sync EV chargers** who want better compatibility and stability
 - **License:** Same as original (see LICENSE file)
 
-## 🎯 What's Been Customized
+## 🎯 Key Features
 
-This branch **builds on top of** the original integration with device-specific fixes:
+This branch **builds on top of** the original integration with device-specific improvements:
 
-## 🎯 What's Been Customized
+✨ **BG Sync-Specific Enhancements:**
+- **Enhanced switch state stability** — Fixes permanent stuck states after Home Assistant restart
+- **Optimized CT clamp handling** — Reliable sensor updates and entity management
+- **Improved HA notifications** — Efficient data transfer notifications to Home Assistant
+- **Streamlined configuration** — Simplified Local Authorization List handling
+- **Better protocol compatibility** — Enhanced support for BG Sync charger variations
 
-This branch **builds on top of** the original integration with device-specific fixes:
-
-✨ **BG Sync-Specific Improvements:**
-- Enhanced switch state stability (fixes permanent stuck states after Home Assistant restart)
-- Optimized CT clamp entity handling and sensor updates
-- Improved data transfer notifications to Home Assistant
-- Streamlined Local Authorization List configuration
-- Better compatibility with BG Sync EV charger protocol variations
+⚡ **Advanced Capabilities:**
+- **EVCC Compatible** — Full integration with EVCC for advanced charging automation
+- **Brightness Control** — Adjust outdoor charger port LED brightness for visual feedback
+  - Perfect for automations: 1% brightness at dusk, 30% at dawn, etc.
+  - Create custom lighting scenes based on charging status
+- **Solar Charging Ready** — Reliable integration with EVCC for solar-powered EV charging
+  - Consistent power monitoring for solar optimization
+  - Stable communication for grid-aware charging
 
 ## ❓ Not for BG Sync? Use the Original
 
