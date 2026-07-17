@@ -5,22 +5,40 @@
 
 # OCPP Integration for Home Assistant - BG Sync EV Customization
 
-> **Device-specific fork optimized for BG Sync EV chargers**
+## ⚡ What This Is
 
-This is a **customized branch** of the excellent [Home Assistant OCPP integration](https://github.com/lbbrhzn/ocpp) with enhancements tailored specifically for **BG Sync EV chargers**.
+This is a **customized version** of the [original OCPP integration by lbbrhzn](https://github.com/lbbrhzn/ocpp), **specifically optimized for BG Sync EV chargers** used in Home Assistant.
 
-## 🎯 About This Fork
+### 📌 Quick Facts
+- **Based on:** [lbbrhzn/ocpp](https://github.com/lbbrhzn/ocpp) - Home Assistant OCPP integration
+- **What it does:** Connects EV chargers to Home Assistant using OCPP protocol
+- **Who it's for:** Users with **BG Sync EV chargers** who want better compatibility and stability
+- **License:** Same as original (see LICENSE file)
 
-This branch maintains full compatibility with the original project while adding device-specific optimizations:
+## 🎯 What's Been Customized
 
-✨ **What's Different:**
+This branch **builds on top of** the original integration with device-specific fixes:
+
+## 🎯 What's Been Customized
+
+This branch **builds on top of** the original integration with device-specific fixes:
+
+✨ **BG Sync-Specific Improvements:**
 - Enhanced switch state stability (fixes permanent stuck states after Home Assistant restart)
 - Optimized CT clamp entity handling and sensor updates
 - Improved data transfer notifications to Home Assistant
 - Streamlined Local Authorization List configuration
 - Better compatibility with BG Sync EV charger protocol variations
 
-## 📦 Installation
+## ❓ Not for BG Sync? Use the Original
+
+If you have a **different charger**, use the [original OCPP integration](https://github.com/lbbrhzn/ocpp):
+```bash
+# Original project (supports many chargers):
+git clone https://github.com/lbbrhzn/ocpp.git
+```
+
+## 📦 Installation for BG Sync Users
 
 Clone this specific branch:
 
