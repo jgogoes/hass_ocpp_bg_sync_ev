@@ -1,20 +1,21 @@
 {
-	"domain": "ocpp",
-	"name": "Open Charge Point Protocol (OCPP)",
-	"after_dependencies": [
-		"persistent_notification"
-	],
-	"codeowners": [
-		"@lbbrhzn",
-		"@drc38"
-	],
-	"config_flow": true,
-	"documentation": "https://github.com/lbbrhzn/ocpp/blob/main/README.md",
-	"iot_class": "local_push",
-	"issue_tracker": "https://github.com/lbbrhzn/ocpp/issues",
-	"requirements": [
-		"ocpp>=2.1.0",
-		"websockets>=14.1"
-	],
-	"version": "0.8.0"
+  "domain": "ocpp",
+  "name": "Open Charge Point Protocol (OCPP) - BG Sync EV",
+  "after_dependencies": [
+    "persistent_notification"
+  ],
+  "codeowners": [
+    "@lbbrhzn",
+    "@drc38",
+    "@jgogoes"
+  ],
+  "config_flow": true,
+  "documentation": "https://github.com/jgogoes/hass_ocpp_bg_sync_ev_clean/blob/bg-sync-custom/README.md",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/jgogoes/hass_ocpp_bg_sync_ev_clean/issues",
+  "requirements": [
+    "ocpp>=2.1.0",
+    "websockets>=14.1"
+  ],
+  "version": "0.10.18-bgsync.1"
 }
