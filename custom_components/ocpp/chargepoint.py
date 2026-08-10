@@ -379,7 +379,9 @@ class ChargePoint(cp):
                 except asyncio.CancelledError:
                     raise
                 except Exception as ex:
-                    _LOGGER.debug("post_connect: set_availability ignored error: %s", ex)
+                    _LOGGER.debug(
+                        "post_connect: set_availability ignored error: %s", ex
+                    )
             else:
                 _LOGGER.debug(
                     "post_connect: skipping set_availability, active transaction %s",
