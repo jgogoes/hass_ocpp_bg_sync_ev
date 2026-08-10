@@ -40,7 +40,7 @@ class OcppButtonDescription(ButtonEntityDescription):
 BUTTONS: Final = [
     OcppButtonDescription(
         key="reset",
-        name="Reset",
+        name="Restart Charger",
         device_class=ButtonDeviceClass.RESTART,
         entity_category=EntityCategory.CONFIG,
         press_action=HAChargerServices.service_reset.name,
@@ -48,7 +48,7 @@ BUTTONS: Final = [
     ),
     OcppButtonDescription(
         key="unlock",
-        name="Unlock",
+        name="Unlock Connector",
         device_class=None,
         entity_category=EntityCategory.CONFIG,
         press_action=HAChargerServices.service_unlock.name,
