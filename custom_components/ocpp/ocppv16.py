@@ -658,11 +658,24 @@ class ChargePoint(cp):
             # so keep the previous behaviour rather than guess a conversion.
             cpmp_value = limit_value
 
+        # Deliberately NOT part of the return value. The ceiling carries
+        # cpmp_value (the hardware maximum), not the requested limit, and once
+        # pinned it is served from cache on every subsequent call -- so folding
+        # it into the result would report success whenever the ceiling was
+        # merely unchanged, even if the requested limit never applied. Under
+        # upstream #2052 that would record a confirmed value the charger is not
+        # holding, which is the exact failure that guard exists to prevent.
         cpmp_ok = await _apply_profile(
             ChargingProfilePurposeType.charge_point_max_profile.value,
             0,
             value=cpmp_value,
         )
+        if not cpmp_ok:
+            _LOGGER.warning(
+                "Could not set the station charging ceiling to %s; the session "
+                "is still bounded by the charger's own MaxCurrent setting.",
+                cpmp_value,
+            )
 
         # With an active transaction, TxProfile is what affects the ongoing
         # session.
@@ -684,7 +697,11 @@ class ChargePoint(cp):
                 "Active TxProfile applied, but TxDefaultProfile did not stick."
             )
 
-        return bool(cpmp_ok or txp_ok or txd_ok)
+        # Success means the REQUESTED limit is in force, which only a
+        # Tx-purpose profile can establish. The caller treats False as a
+        # refusal and reverts the displayed value, so this must not report
+        # success on the strength of the ceiling alone.
+        return bool(txp_ok or txd_ok)
 
     async def set_availability(self, state: bool = True, connector_id: int | None = 0):
         """Change availability."""

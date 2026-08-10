@@ -334,6 +334,11 @@ class ChargePointNumber(RestoreNumber, NumberEntity):
         # display-owns-latest-accepted invariant provable right here.
         self._request_seq: int = 0
         self._accepted_seq: int = 0
+        # BG Sync fork: True once this session has had a request accepted by
+        # the charger. Deliberately NOT restored, unlike _confirmed_value --
+        # it gates the no-op suppression so a restored value can never cause
+        # the first request after a restart to be skipped.
+        self._sent_this_session: bool = False
         self._attr_should_poll = False
 
     async def async_added_to_hass(self) -> None:
@@ -434,10 +439,18 @@ class ChargePointNumber(RestoreNumber, NumberEntity):
         # (max) are never swallowed. Nothing was transmitted in the suppressed
         # case, so _confirmed_value and _accepted_seq are deliberately left
         # untouched: the charger still holds whatever it last accepted.
+        #
+        # Never suppress before this session has successfully sent something.
+        # _confirmed_value is restored from the previous session, and the
+        # charger may have been reset or had its profiles cleared in between --
+        # suppressing on the strength of a restored value could then leave the
+        # limit never applied at all. As everywhere else in this flow, the
+        # failure mode is unsafe-by-default: the limit would fail upward.
         at_boundary = target in (self.native_min_value, self.native_max_value)
         if (
             CHARGE_RATE_STEP
             and not at_boundary
+            and self._sent_this_session
             and self._confirmed_value is not None
             and _quantise_rate(target) == _quantise_rate(self._confirmed_value)
         ):
@@ -497,6 +510,7 @@ class ChargePointNumber(RestoreNumber, NumberEntity):
             return
         self._accepted_seq = seq
         self._confirmed_value = target
+        self._sent_this_session = True
         if self._attr_native_value != target:
             # A request that started later failed while this one was in
             # flight and rolled the slider back. This limit is the one the
