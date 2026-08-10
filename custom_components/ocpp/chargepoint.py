@@ -346,19 +346,45 @@ class ChargePoint(cp):
             # if an entry differs this will unload/reload and stop/restart the central system/websocket
             self.hass.config_entries.async_update_entry(self.entry, data=updated_entry)
 
-            await self.set_standard_configuration()
+            # BG Sync fork: set_standard_configuration sends GetConfiguration and
+            # ChangeConfiguration to the charger. Some chargers (SyncEV among
+            # them) are slow to respond and time out, which previously aborted
+            # post_connect and left post_connect_success False -- producing a
+            # retry loop that never settled. Isolate it so a timeout here is
+            # non-fatal and the rest of post_connect still runs.
+            try:
+                await self.set_standard_configuration()
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:
+                _LOGGER.debug(
+                    "post_connect: set_standard_configuration failed non-fatally: %s",
+                    ex,
+                )
 
             self.post_connect_success = True
             _LOGGER.debug("'%s' post connection setup completed successfully", self.id)
 
             # nice to have, but not needed for integration to function
-            # and can cause issues with some chargers
-            try:
-                await self.set_availability()
-            except asyncio.CancelledError:
-                raise
-            except Exception as ex:
-                _LOGGER.debug("post_connect: set_availability ignored error: %s", ex)
+            # and can cause issues with some chargers.
+            #
+            # BG Sync fork: skip entirely while a transaction is active. Sending
+            # ChangeAvailability mid-session toggles the CP pilot signal, which
+            # some EVs treat as a fault -- on a VW ID.3 it raises C1249 "Too Many
+            # Wake-Up Requests" and drops the charge. Reconnects during a session
+            # are exactly when this fires, because post_connect runs again.
+            if self.active_transaction_id == 0:
+                try:
+                    await self.set_availability()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as ex:
+                    _LOGGER.debug("post_connect: set_availability ignored error: %s", ex)
+            else:
+                _LOGGER.debug(
+                    "post_connect: skipping set_availability, active transaction %s",
+                    self.active_transaction_id,
+                )
 
             if prof.REM in self._attr_supported_features:
                 if self.received_boot_notification is False:
