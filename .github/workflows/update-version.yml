@@ -16,7 +16,7 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
       run: |
-        VERSION=${GITHUB_REF#refs/tags/}
+        VERSION=${GITHUB_REF#refs/tags/v}
         MANIFEST=custom_components/ocpp/manifest.json
         jq --arg version "$VERSION" '.version = $version' $MANIFEST > tmp.json && mv tmp.json $MANIFEST
         git config --global user.name 'github-actions[bot]'
