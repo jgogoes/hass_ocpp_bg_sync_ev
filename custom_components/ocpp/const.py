@@ -67,6 +67,52 @@ DEFAULT_OCPP_VERSION = OCPP_VERSION_AUTO
 OCPP_VERSIONS = [OCPP_VERSION_AUTO, "1.6", "2.0.1", "2.1"]
 DEFAULT_METER_INTERVAL = 60
 DEFAULT_IDLE_INTERVAL = 900
+
+# --- BG Sync fork ---------------------------------------------------------
+# SyncEV EVSC7S resets its indicator LED to a bright default on every
+# power-cycle. LightIntensity is a standard OCPP key (0-100, percentage of max
+# brightness per spec) but this charger omits it from its GetConfiguration
+# dump -- it must be queried and set by name explicitly. Confirmed writable on
+# SL320S647 2026-08-10 (30 and 100 both accepted and read back).
+DEFAULT_LIGHT_INTENSITY = 100
+
+# charge_point_model strings (as reported in BootNotification, exposed via
+# sensor.<cpid>_model) on which the vendor-proprietary keys below are expected
+# to exist. EVSC7S is confirmed on real hardware; the rest are other models in
+# the same Sync Energy range that share the config-key vocabulary but have not
+# been individually tested. Only vendor-specific behaviour is gated on this --
+# standard OCPP features are never gated.
+SYNCEV_VENDOR_KEY_MODELS = [
+    "EVSC7S",
+    "EVL7PS",
+    "EVL7PSG",
+    "EVL7MS",
+    "EVL7MSG",
+    "EVLR7MS",
+    "EVLR7MSG",
+    "EVLS7MS",
+    "EVLS7MSG",
+]
+
+# Control granularity of the charger, in Amps.
+#
+# Measured on SL320S647 2026-08-10 with an EV attached and drawing, sweeping
+# the TxProfile limit in 0.1 A steps with the ceiling parked at 32 A:
+#     10.0 / 10.1 / 10.5 / 10.9 A requested -> Current.Offered 10 A
+#     13.0 / 13.4 A requested             -> Current.Offered 13 A
+# Current.Import was flat within each group (9.86-9.91, then 12.69-12.78), and
+# is reported to two decimals, so this is genuine hardware behaviour rather
+# than a reporting artefact: the charger FLOORS rather than rounds.
+#
+# A request that floors to the same whole amp as the last one sent therefore
+# cannot change the current delivered to the car and is not worth an OCPP
+# round-trip. Solar-following controllers such as evcc recompute a target every
+# cycle and will ask for 12.7 -> 13.1 -> 12.9 A within a minute; all three are
+# 13 A at the charger. Comparing floored values rather than applying a plain
+# deadband means no control resolution is lost. Set to 0 to disable.
+CHARGE_RATE_STEP = 1.0
+# --------------------------------------------------------------------------
+
 DEFAULT_WEBSOCKET_CLOSE_TIMEOUT = 10
 DEFAULT_WEBSOCKET_PING_TRIES = 2
 DEFAULT_WEBSOCKET_PING_INTERVAL = 20

@@ -131,3 +131,6 @@ dmypy.json
 # HA Development
 /config/
 .DS_Store
+
+# BG Sync fork: local backups of the deployed integration
+_backups/

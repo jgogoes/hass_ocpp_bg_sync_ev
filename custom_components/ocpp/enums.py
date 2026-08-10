@@ -51,6 +51,10 @@ class HAChargerDetails(str, Enum):
     data_response = "Timestamp.Data.Response"
     data_transfer = "Timestamp.Data.Transfer"
     config_response = "Timestamp.Config.Response"
+    # BG Sync fork: supply-side readings pushed by SyncEV chargers as a
+    # vendor DataTransfer (see on_data_transfer in ocppv16.py).
+    ct_clamp_current = "Current.CtClamp"
+    ct_clamp_voltage = "Voltage.CtClamp"
 
 
 class HAChargerSession(str, Enum):
@@ -116,6 +120,11 @@ class OcppMisc(str, Enum):
     feature_profile_remote = "RemoteTrigger"
     feature_profile_auth = "LocalAuthListManagement"
     tech_info = "techInfo"
+    # BG Sync fork: vendor-specific fault detail carried alongside the
+    # standard errorCode on StatusNotification. Upstream discards these.
+    vendor_id = "vendorId"
+    vendor_error_code = "vendorErrorCode"
+    info = "info"
 
     # for use with Smart Charging
     current = "Current"
