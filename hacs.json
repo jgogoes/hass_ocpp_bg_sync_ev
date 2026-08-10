@@ -1,5 +1,5 @@
 {
-  "name": "Open Charge Point Protocol (OCPP)",
+  "name": "OCPP - BG Sync EV",
   "content_in_root": false,
   "homeassistant": "2022.7.0",
   "render_readme": true,

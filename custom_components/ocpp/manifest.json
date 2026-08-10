@@ -10,7 +10,7 @@
     "@jgogoes"
   ],
   "config_flow": true,
-  "documentation": "https://github.com/jgogoes/hass_ocpp_bg_sync_ev/blob/bg-sync-custom/README.md",
+  "documentation": "https://github.com/jgogoes/hass_ocpp_bg_sync_ev/blob/bg-sync-custom/FORK.md",
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/jgogoes/hass_ocpp_bg_sync_ev/issues",
   "requirements": [
