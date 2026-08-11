@@ -363,13 +363,23 @@ class ChargePointSwitch(SwitchEntity):
         took effect (verified by an unprompted StartTransaction on plug-in).
         So a mismatch is not evidence the write failed, and for keys flagged
         ocpp_readback_ambiguous the commanded value stays authoritative.
+
+        Comparison is case-insensitive because this charger is inconsistent
+        about it: UnlockConnectorOnEVSideDisconnect reports lowercase "true"
+        when set, but capital "False" when cleared, and AuthorizeRemoteTxRequests
+        reports "False" too while LocalAuthorizeOffline reports lowercase
+        "true". A case-sensitive match sent every boolean 'off' state down the
+        unknown-value path, which logged a spurious warning and -- worse -- left
+        the switch unable to determine its state from a read on startup, so it
+        fell back to default_state. Measured 2026-08-11.
         """
         self._raw_value = actual
         if actual is None:
             return
-        if actual == self.entity_description.ocpp_on_value:
+        reported = actual.strip().casefold()
+        if reported == self.entity_description.ocpp_on_value.strip().casefold():
             self._state = True
-        elif actual == self.entity_description.ocpp_off_value:
+        elif reported == self.entity_description.ocpp_off_value.strip().casefold():
             self._state = False
         elif self.entity_description.ocpp_readback_ambiguous:
             # Known and expected for this key -- keep the commanded state.
