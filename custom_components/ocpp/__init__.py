@@ -236,13 +236,40 @@ async def async_migrate_entry(hass, config_entry: ConfigEntry):
     return True
 
 
+def _abort_sync_charge_points(central_sys) -> None:
+    """Hard-disconnect only Sync EV chargers before normal server shutdown."""
+    for charge_point in central_sys.charge_points.values():
+        if not charge_point.requires_abrupt_disconnect:
+            continue
+
+        charge_point._aborting_connection = True
+        try:
+            charge_point._connection.transport.abort()
+            _LOGGER.debug(
+                "Hard-disconnected Sync EV charger '%s' during unload",
+                charge_point.id,
+            )
+        except Exception:
+            _LOGGER.debug(
+                "Unable to abort Sync EV transport for '%s'",
+                charge_point.id,
+                exc_info=True,
+            )
+
+
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Handle removal of an entry."""
     unloaded = False
     if DOMAIN in hass.data:
         if entry.entry_id in hass.data[DOMAIN]:
-            # Close server
             central_sys = hass.data[DOMAIN][entry.entry_id]
+
+            # Sync Energy / BG Sync EV firmware can reboot when HA initiates
+            # a graceful WebSocket CLOSE. Hard-abort only those known Sync
+            # connections first. The normal server.close() below is retained,
+            # preserving upstream graceful shutdown for every non-Sync charger.
+            _abort_sync_charge_points(central_sys)
+
             central_sys._server.close()
             await central_sys._server.wait_closed()
             # Unload services

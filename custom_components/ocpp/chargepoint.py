@@ -269,6 +269,10 @@ class ChargePoint(cp):
         self.received_boot_notification = False
         self.post_connect_success = False
         self.tasks = None
+        # Set only during HA/OCPP unload for Sync EV hardware. It prevents
+        # stop() from sending a second, graceful WebSocket CLOSE after the
+        # Sync transport has already been intentionally aborted.
+        self._aborting_connection = False
         self._charger_reports_session_energy = False
 
         # Connector-aware, but backwards compatible:
@@ -334,17 +338,37 @@ class ChargePoint(cp):
 
             accepted_measurands: str = await self.get_supported_measurands()
             updated_entry = {**self.entry.data}
+            entry_changed = False
+
             for i in range(len(updated_entry[CONF_CPIDS])):
                 if self.id in updated_entry[CONF_CPIDS][i]:
                     s = updated_entry[CONF_CPIDS][i][self.id]
-                    if s.get(CONF_MONITORED_VARIABLES) != accepted_measurands or s.get(
-                        CONF_NUM_CONNECTORS
-                    ) != int(self.num_connectors):
+
+                    if s.get(CONF_MONITORED_VARIABLES) != accepted_measurands:
                         s[CONF_MONITORED_VARIABLES] = accepted_measurands
+                        entry_changed = True
+
+                    if s.get(CONF_NUM_CONNECTORS) != int(self.num_connectors):
                         s[CONF_NUM_CONNECTORS] = int(self.num_connectors)
+                        entry_changed = True
+
                     break
-            # if an entry differs this will unload/reload and stop/restart the central system/websocket
-            self.hass.config_entries.async_update_entry(self.entry, data=updated_entry)
+
+            # Updating a config entry triggers an OCPP reload. Only do this
+            # when charger discovery actually changed the stored values.
+            if entry_changed:
+                _LOGGER.debug(
+                    "Charger '%s' configuration changed; updating config entry",
+                    self.id,
+                )
+                self.hass.config_entries.async_update_entry(
+                    self.entry, data=updated_entry
+                )
+            else:
+                _LOGGER.debug(
+                    "Charger '%s' configuration unchanged; no config entry reload",
+                    self.id,
+                )
 
             # BG Sync fork: set_standard_configuration sends GetConfiguration and
             # ChangeConfiguration to the charger. Some chargers (SyncEV among
@@ -585,13 +609,28 @@ class ChargePoint(cp):
         finally:
             await self.stop()
 
+    @property
+    def requires_abrupt_disconnect(self) -> bool:
+        """Return whether this charger needs the Sync EV unload workaround."""
+        vendor = self._metrics[(0, cdet.vendor.value)].value
+        normalized = str(vendor or "").strip().casefold()
+        return any(
+            marker in normalized for marker in ("sync energy", "sync ev", "syncev")
+        )
+
     async def stop(self):
         """Close connection and cancel ongoing tasks."""
         self.status = STATE_UNAVAILABLE
         try:
             if self._connection.state is State.OPEN:
-                _LOGGER.debug(f"Closing websocket to '{self.id}'")
-                await self._connection.close()
+                if self._aborting_connection:
+                    _LOGGER.debug(
+                        "Sync EV unload: websocket to '%s' was hard-disconnected",
+                        self.id,
+                    )
+                else:
+                    _LOGGER.debug(f"Closing websocket to '{self.id}'")
+                    await self._connection.close()
         finally:
             # Cancel regardless of how the close went: a close that raises or
             # is cancelled must not leave monitor_connection running against a
