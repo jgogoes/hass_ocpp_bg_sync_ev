@@ -329,6 +329,10 @@ class ChargePoint(cp):
         self._start_pending = True
         self._reconnect_token = None
         self._retirement_tasks: set[asyncio.Task] = set()
+        # Set only during HA/OCPP unload for Sync EV hardware. It prevents
+        # stop() from sending a second, graceful WebSocket CLOSE after the
+        # Sync transport has already been intentionally aborted.
+        self._aborting_connection = False
         self._charger_reports_session_energy = False
 
         # Connector-aware, but backwards compatible:
@@ -404,17 +408,37 @@ class ChargePoint(cp):
 
             accepted_measurands: str = await self.get_supported_measurands()
             updated_entry = {**self.entry.data}
+            entry_changed = False
+
             for i in range(len(updated_entry[CONF_CPIDS])):
                 if self.id in updated_entry[CONF_CPIDS][i]:
                     s = updated_entry[CONF_CPIDS][i][self.id]
-                    if s.get(CONF_MONITORED_VARIABLES) != accepted_measurands or s.get(
-                        CONF_NUM_CONNECTORS
-                    ) != int(self.num_connectors):
+
+                    if s.get(CONF_MONITORED_VARIABLES) != accepted_measurands:
                         s[CONF_MONITORED_VARIABLES] = accepted_measurands
+                        entry_changed = True
+
+                    if s.get(CONF_NUM_CONNECTORS) != int(self.num_connectors):
                         s[CONF_NUM_CONNECTORS] = int(self.num_connectors)
+                        entry_changed = True
+
                     break
-            # if an entry differs this will unload/reload and stop/restart the central system/websocket
-            self.hass.config_entries.async_update_entry(self.entry, data=updated_entry)
+
+            # Updating a config entry triggers an OCPP reload. Only do this
+            # when charger discovery actually changed the stored values.
+            if entry_changed:
+                _LOGGER.debug(
+                    "Charger '%s' configuration changed; updating config entry",
+                    self.id,
+                )
+                self.hass.config_entries.async_update_entry(
+                    self.entry, data=updated_entry
+                )
+            else:
+                _LOGGER.debug(
+                    "Charger '%s' configuration unchanged; no config entry reload",
+                    self.id,
+                )
 
             # BG Sync fork: set_standard_configuration sends GetConfiguration and
             # ChangeConfiguration to the charger. Some chargers (SyncEV among
@@ -851,8 +875,17 @@ class ChargePoint(cp):
             """Close this session's socket and cancel only its captured children."""
             try:
                 if connection.state is State.OPEN:
-                    _LOGGER.debug(f"Closing websocket to '{self.id}'")
-                    await connection.close()
+                    if self._aborting_connection:
+                        # Sync EV firmware can reboot when HA starts a
+                        # graceful close, so unload aborted the transport
+                        # already and a second, graceful close is skipped.
+                        _LOGGER.debug(
+                            "Sync EV unload: websocket to '%s' was hard-disconnected",
+                            self.id,
+                        )
+                    else:
+                        _LOGGER.debug(f"Closing websocket to '{self.id}'")
+                        await connection.close()
             finally:
                 for task in tasks:
                     task.cancel()
@@ -926,8 +959,14 @@ class ChargePoint(cp):
         normalized = str(vendor or "").strip().casefold()
         if any(m in normalized for m in ("sync energy", "sync ev", "syncev")):
             return True
-        model = self._metrics[(0, cdet.model.value)].value
+        model_metric = self._metrics.get((0, cdet.model.value))
+        model = model_metric.value if model_metric is not None else None
         return model in SYNCEV_VENDOR_KEY_MODELS
+
+    @property
+    def requires_abrupt_disconnect(self) -> bool:
+        """Return whether this charger needs the Sync EV unload workaround."""
+        return self.is_sync_charger
 
     async def stop(self):
         """Stop the session and invalidate pending initial start and reconnects."""
