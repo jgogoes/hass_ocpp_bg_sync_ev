@@ -89,7 +89,7 @@ DEFAULT_IDLE_INTERVAL = 900
 # power-cycle. LightIntensity is a standard OCPP key (0-100, percentage of max
 # brightness per spec) but this charger omits it from its GetConfiguration
 # dump -- it must be queried and set by name explicitly. Confirmed writable on
-# SL320S647 2026-08-10 (30 and 100 both accepted and read back).
+# the EVSC7S, 2026-08-10 (30 and 100 both accepted and read back).
 DEFAULT_LIGHT_INTENSITY = 100
 
 # charge_point_model strings (as reported in BootNotification, exposed via
@@ -112,7 +112,7 @@ SYNCEV_VENDOR_KEY_MODELS = [
 
 # Control granularity of the charger, in Amps.
 #
-# Measured on SL320S647 2026-08-10 with an EV attached and drawing, sweeping
+# Measured on the EVSC7S 2026-08-10 with an EV attached and drawing, sweeping
 # the TxProfile limit in 0.1 A steps with the ceiling parked at 32 A:
 #     10.0 / 10.1 / 10.5 / 10.9 A requested -> Current.Offered 10 A
 #     13.0 / 13.4 A requested             -> Current.Offered 13 A

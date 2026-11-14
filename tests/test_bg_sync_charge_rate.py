@@ -1,6 +1,6 @@
 """Tests for the BG Sync fork's charge-rate handling.
 
-Every expected value here was measured on a SyncEV EVSC7S (serial SL320S647,
+Every expected value here was measured on a SyncEV EVSC7S (
 firmware RD0045-V1.02-S1.01) on 2026-08-10, against upstream v0.10.18. These
 are regression tests for hardware behaviour, so if one fails either the code
 changed or the charger did -- re-measure before adjusting an expectation.
