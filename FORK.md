@@ -4,8 +4,9 @@ A fork of [lbbrhzn/ocpp](https://github.com/lbbrhzn/ocpp) carrying fixes for
 **SyncEV / Sync Energy** chargers, developed against a **SyncEV EVSC7S**
 (serial `SL320S647`, firmware `RD0045-V1.02-S1.01`) driven by evcc.
 
-**Base: upstream `v0.10.18`.** Every change is additive or a narrowly scoped
-fix; no upstream behaviour is removed.
+**Base: upstream `main` at `c514238` (2026-11-11, after `v0.12.3`).** Every
+change is additive or a narrowly scoped fix; no upstream behaviour is removed
+for chargers other than Sync Energy. See "Rebase onto upstream v0.12.3" below.
 
 > Every claim below was measured on real hardware on 2026-08-10, not inferred.
 > Full method and raw responses are in [`HARDWARE-FINDINGS.md`](HARDWARE-FINDINGS.md).
@@ -94,13 +95,33 @@ Copy `custom_components/ocpp/` into your Home Assistant `config/custom_component
 and restart. If your config share is SMB, note that deletes are often blocked —
 `cp -f` works where `rm` and `tar -x` do not.
 
-## Upstream divergences to retire on the next rebase
+## Rebase onto upstream v0.12.3
 
-- `sensor.py` keeps a local `_uid()` that replaces dots with underscores.
-  Upstream fixes the same bug properly in `v0.10.19b0` by single-sourcing
-  `const.sensor_unique_id()`. Delete the local copy when rebasing past v0.10.18.
-- The CT clamp handler calls the full `update()`. `v0.10.19b0` adds
-  `_async_refresh_metric_entities()`, which should be used instead.
+Done 2026-11-14 (fork `1.1.0`). Retired because upstream now covers them:
+
+- The local sensor `_uid()` helper (upstream `sensor_unique_id()`), and the
+  full `update()` after a CT clamp reading is unchanged.
+- Cached rate unit and stack level (upstream reads them once per connection).
+- The cached `ChargePointMaxProfile` ceiling. Upstream no longer rewrites the
+  ceiling on every limit change, so the stale-cap failure it guarded against
+  cannot recur the same way. **Not yet re-measured on the EVSC7S.**
+
+Kept on top of upstream:
+
+- Sync chargers use `reported_max - 1` as the stack level without the
+  `stack_level_below_max` option (the charger rejects the reported maximum).
+  The charger is recognised by vendor, or by a model in `SYNCEV_VENDOR_KEY_MODELS`.
+- Limits are rounded to one decimal place (OCPP `multipleOf 0.1`).
+- Whole-amp no-op suppression on the slider, for Sync chargers only.
+- Non-fatal `set_standard_configuration`, and no `set_availability` during an
+  active transaction.
+- Read-only configuration keys return early.
+- Hard abort of the websocket on unload for Sync chargers (PR #3, BPOD66), so
+  the charger does not reboot when the integration reloads.
+
+**Test on hardware before releasing:** charge-rate control with evcc on a live
+session, a restart of Home Assistant mid-session, and an integration reload
+(the charger must not reboot).
 
 ## Still unverified
 

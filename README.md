@@ -9,7 +9,7 @@ This is [lbbrhzn/ocpp](https://github.com/lbbrhzn/ocpp) with fixes for
 behaviour specific to SyncEV hardware. Everything upstream does, this does too.
 
 > Developed and measured against a **SyncEV EVSC7S** (firmware
-> `RD0045-V1.02-S1.01`) driven by evcc. Base: upstream **v0.10.18**.
+> `RD0045-V1.02-S1.01`) driven by evcc. Base: upstream **v0.12.3** (main at `c514238`).
 
 ## Why this fork
 

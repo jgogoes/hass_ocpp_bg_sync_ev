@@ -11,7 +11,7 @@ import ssl
 from functools import partial
 from homeassistant.config_entries import ConfigEntry, SOURCE_INTEGRATION_DISCOVERY
 from homeassistant.const import STATE_OK, STATE_UNAVAILABLE
-from homeassistant.core import HomeAssistant, ServiceResponse, SupportsResponse
+from homeassistant.core import HomeAssistant, ServiceResponse
 from homeassistant.exceptions import HomeAssistantError
 import homeassistant.helpers.config_validation as cv
 import voluptuous as vol
@@ -29,10 +29,13 @@ from .const import (
     OCPP_2_0,
     OCPP_VERSION_AUTO,
     ChargerSystemSettings,
+    settings_from_config,
 )
 from .enums import (
     HAChargerServices as csvcs,
+    HAChargerSession as csess,
     HAChargerStatuses as cstat,
+    Profiles as prof,
 )
 from .chargepoint import SetVariableResult
 
@@ -81,7 +84,10 @@ CHRGR_SERVICE_DATA_SCHEMA = vol.Schema(
         vol.Optional("limit_amps"): cv.positive_float,
         vol.Optional("limit_watts"): cv.positive_int,
         vol.Optional("conn_id"): cv.positive_int,
-        vol.Optional("custom_profile"): vol.Any(cv.string, dict),
+        # Keep a mapping returned by Home Assistant's template engine as a
+        # mapping. cv.string deliberately unwraps ResultWrapper dictionaries
+        # to their rendered text, so it must be tried after dict.
+        vol.Optional("custom_profile"): vol.Any(dict, cv.string),
     }
 )
 CUSTMSG_SERVICE_DATA_SCHEMA = vol.Schema(
@@ -92,8 +98,111 @@ CUSTMSG_SERVICE_DATA_SCHEMA = vol.Schema(
 )
 
 
+def _connector_id(value) -> int:
+    """Validate an integral, positive connector ID.
+
+    ``vol.Coerce(int)`` would silently truncate fractional values
+    (``1.9`` -> ``1``), changing the meaning of the request. Reject
+    those instead.
+    """
+    if isinstance(value, bool):
+        raise vol.Invalid("conn_id must be an integer")
+    if isinstance(value, int):
+        as_int = value
+    elif isinstance(value, float):
+        # float() rounding must not turn a fraction into a valid id, and
+        # inf/nan must not reach int()
+        if not value.is_integer():
+            raise vol.Invalid("conn_id must be an integer, not a fraction")
+        as_int = int(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not (text.isdigit() or (text.startswith("-") and text[1:].isdigit())):
+            raise vol.Invalid("conn_id must be an integer")
+        as_int = int(text)
+    else:
+        raise vol.Invalid("conn_id must be an integer")
+    if as_int < 1:
+        raise vol.Invalid("conn_id must be a positive integer")
+    return as_int
+
+
+CLEAR_PROFILE_SERVICE_DATA_SCHEMA = vol.Schema(
+    {
+        vol.Optional("devid"): cv.string,
+        vol.Optional("conn_id"): _connector_id,
+    }
+)
+
+
 def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+
+def _invalid_custom_profile(message: str) -> HomeAssistantError:
+    """Create a caller-visible error without exposing the supplied profile."""
+    return HomeAssistantError(
+        translation_domain=DOMAIN,
+        translation_key="invalid_custom_profile",
+        translation_placeholders={"message": message},
+    )
+
+
+def _json_error_message(error: json.JSONDecodeError) -> str:
+    """Describe a JSON syntax error without including the input document."""
+    return f"invalid JSON: {error.msg} at line {error.lineno}, column {error.colno}"
+
+
+def _parse_custom_profile(custom_profile: dict | str, cp_id: str) -> dict:
+    """Return a custom profile mapping, preserving valid JSON verbatim."""
+    if isinstance(custom_profile, dict):
+        return custom_profile
+
+    if not isinstance(custom_profile, str):
+        raise _invalid_custom_profile(
+            f"expected a mapping or JSON object, got {type(custom_profile).__name__}"
+        )
+
+    used_legacy_fallback = False
+    try:
+        profile = json.loads(custom_profile)
+    except json.JSONDecodeError as original_error:
+        if "'" not in custom_profile:
+            raise _invalid_custom_profile(
+                _json_error_message(original_error)
+            ) from original_error
+
+        try:
+            profile = json.loads(custom_profile.replace("'", '"'))
+        except json.JSONDecodeError as legacy_error:
+            raise _invalid_custom_profile(
+                f"{_json_error_message(original_error)}; "
+                "legacy single-quote compatibility parsing also failed"
+            ) from legacy_error
+        except (ValueError, RecursionError) as legacy_error:
+            raise _invalid_custom_profile(
+                f"{_json_error_message(original_error)}; legacy single-quote "
+                "compatibility parsing exceeded JSON parser limits"
+            ) from legacy_error
+        used_legacy_fallback = True
+    except (ValueError, RecursionError) as parser_error:
+        raise _invalid_custom_profile(
+            "JSON could not be decoded within parser limits"
+        ) from parser_error
+
+    if not isinstance(profile, dict):
+        raise _invalid_custom_profile(
+            f"expected a JSON object, got {type(profile).__name__}"
+        )
+
+    if used_legacy_fallback:
+        _LOGGER.debug(
+            "%s: parsed custom_profile using legacy single-quote compatibility; "
+            "prefer a mapping or valid JSON object",
+            cp_id,
+        )
+
+    return profile
 
 
 class CentralSystem:
@@ -103,7 +212,7 @@ class CentralSystem:
         """Instantiate instance of a CentralSystem."""
         self.hass = hass
         self.entry = entry
-        self.settings = CentralSystemSettings(**entry.data)
+        self.settings = settings_from_config(CentralSystemSettings, entry.data)
         self.subprotocols = self._resolve_subprotocols(self.settings)
         self._server = None
         self.id = self.settings.csid
@@ -116,56 +225,10 @@ class CentralSystem:
         # setup actually did whenever state changed in between.
         self.platforms_forwarded = False
 
-        # Register custom services with home assistant
-        self.hass.services.async_register(
-            DOMAIN,
-            csvcs.service_configure.value,
-            self.handle_configure,
-            CONF_SERVICE_DATA_SCHEMA,
-            supports_response=SupportsResponse.OPTIONAL,
-        )
-        self.hass.services.async_register(
-            DOMAIN,
-            csvcs.service_get_configuration.value,
-            self.handle_get_configuration,
-            GCONF_SERVICE_DATA_SCHEMA,
-            supports_response=SupportsResponse.ONLY,
-        )
-        self.hass.services.async_register(
-            DOMAIN,
-            csvcs.service_data_transfer.value,
-            self.handle_data_transfer,
-            TRANS_SERVICE_DATA_SCHEMA,
-        )
-        self.hass.services.async_register(
-            DOMAIN,
-            csvcs.service_trigger_custom_message.value,
-            self.handle_trigger_custom_message,
-            CUSTMSG_SERVICE_DATA_SCHEMA,
-        )
-        self.hass.services.async_register(
-            DOMAIN,
-            csvcs.service_clear_profile.value,
-            self.handle_clear_profile,
-        )
-        self.hass.services.async_register(
-            DOMAIN,
-            csvcs.service_set_charge_rate.value,
-            self.handle_set_charge_rate,
-            CHRGR_SERVICE_DATA_SCHEMA,
-        )
-        self.hass.services.async_register(
-            DOMAIN,
-            csvcs.service_update_firmware.value,
-            self.handle_update_firmware,
-            UFW_SERVICE_DATA_SCHEMA,
-        )
-        self.hass.services.async_register(
-            DOMAIN,
-            csvcs.service_get_diagnostics.value,
-            self.handle_get_diagnostics,
-            GDIAG_SERVICE_DATA_SCHEMA,
-        )
+        # Service registration is performed globally by the integration setup
+        # (custom_components/ocpp/__init__.py) so that multiple central system
+        # instances do not overwrite each other's handlers.  See
+        # _register_domain_services() in __init__.py.
 
     @staticmethod
     async def create(hass: HomeAssistant, entry: ConfigEntry):
@@ -308,7 +371,9 @@ class CentralSystem:
                 for cfg in self.settings.cpids:
                     if cfg.get(cp_id):
                         config_flow = True
-                        cp_settings = ChargerSystemSettings(**list(cfg.values())[0])
+                        cp_settings = settings_from_config(
+                            ChargerSystemSettings, list(cfg.values())[0]
+                        )
                         _LOGGER.info(
                             f"Charger match found for {cp_settings.cpid}:{cp_id}"
                         )
@@ -449,6 +514,65 @@ class CentralSystem:
                 return val
 
         return None
+
+    def is_transaction_indeterminate(
+        self, id: str, connector_id: int | None = None
+    ) -> bool:
+        """Return whether a connector's transaction state is held as unresolved.
+
+        An OCPP 1.6 charge point holds a connector when a StopTransaction
+        could not be attributed to it with certainty; controls that act on
+        the connector's transaction stay unavailable until the charger's
+        next status report settles it.
+        """
+        cp_id = self.cpids.get(id, id)
+        cp = self.charge_points.get(cp_id)
+        unsafe = getattr(cp, "transaction_is_unsafe", None)
+        if unsafe is None:
+            held = getattr(cp, "_tx_indeterminate", None)
+            return bool(held) and connector_id in held
+        # The same rule stop_transaction applies: held, or sharing its id
+        # with a held connector, so the entity never offers a stop that the
+        # charge point would refuse.
+        return bool(unsafe(connector_id))
+
+    def get_availability_status(self, id: str):
+        """Return the status that drives the charger availability switch.
+
+        A station-level status is authoritative when the charger reports one.
+        Some single-connector chargers only send StatusNotification for
+        connector 1, so use that connector's status only while the station
+        status is absent. Never apply this fallback to a charger known to have
+        multiple connectors.
+        """
+        _, _, cp, runtime_connectors = self._get_metrics(id)
+        if cp is None:
+            return None
+
+        station_status = self.get_metric(id, cstat.status, connector_id=0)
+        if station_status is not None:
+            # Metrics carry no observation timestamp, so presence is the only
+            # reliable precedence signal; once reported, station status stays
+            # authoritative over the connector fallback.
+            return station_status
+
+        configured_connectors = getattr(
+            getattr(cp, "settings", None), "num_connectors", 1
+        )
+        try:
+            configured_connectors = int(configured_connectors)
+        except (TypeError, ValueError):
+            configured_connectors = 1
+        if configured_connectors < 1:
+            configured_connectors = 1
+
+        # During startup the runtime count begins at one until discovery
+        # finishes. If either source already identifies a multi-connector
+        # charger, remain conservative and do not borrow connector 1's state.
+        if max(runtime_connectors, configured_connectors) != 1:
+            return None
+
+        return self.get_metric(id, cstat.status_connector, connector_id=1)
 
     def del_metric(self, id: str, measurand: str, connector_id: int | None = None):
         """Set given measurand to None."""
@@ -593,49 +717,18 @@ class CentralSystem:
         return None
 
     def get_available(self, id: str, connector_id: int | None = None):
-        """Return whether the charger (or a specific connector) is available."""
-        cp_id, m, cp, n_connectors = self._get_metrics(id)
+        """Return whether the charger is connected.
+
+        Only a lost connection makes entities unavailable, whatever connector_id
+        is. A connector's status, Faulted included, is something to show, not a
+        reason to hide it.
+        """
+        _cp_id, _m, cp, _n = self._get_metrics(id)
 
         if cp is None:
             return None
 
-        if self._norm_conn(connector_id) == 0:
-            return cp.status == STATE_OK
-
-        status_val = None
-        with contextlib.suppress(Exception):
-            status_val = m[
-                (self._norm_conn(connector_id), cstat.status_connector.value)
-            ].value
-
-        if not status_val:
-            try:
-                flat = m[cstat.status_connector.value]
-                if hasattr(flat, "extra_attr"):
-                    status_val = flat.extra_attr.get(
-                        self._norm_conn(connector_id)
-                    ) or getattr(flat, "value", None)
-            except Exception:
-                pass
-
-        if not status_val:
-            return cp.status == STATE_OK
-
-        ok_statuses_norm = {
-            "available",
-            "preparing",
-            "charging",
-            "suspendedev",
-            "suspendedevse",
-            "finishing",
-            "occupied",
-            "reserved",
-            "unavailable",  # do NOT make HA entities unavailable for this OCPP state
-        }
-
-        ret = _norm(status_val) in ok_statuses_norm
-        # If backend/WS is down, entity should be unavailable regardless.
-        return ret and (cp.status == STATE_OK)
+        return cp.status == STATE_OK
 
     def get_supported_features(self, id: str):
         """Return what profiles the charger supports."""
@@ -646,16 +739,113 @@ class CentralSystem:
             return self.charge_points[cp_id].supported_features
         return 0
 
+    def session_transaction_id(self, id: str, connector_id: int) -> str | None:
+        """Return the transaction id displayed for a connector, or None."""
+        cp_id, m, cp, _n = self._get_metrics(id)
+        if cp is None:
+            return None
+        value = None
+        with contextlib.suppress(Exception):
+            value = m[(self._norm_conn(connector_id), csess.transaction_id)].value
+        if value in (None, "", 0):
+            return None
+        return str(value)
+
+    def charger_generation(self, id: str) -> int:
+        """Return how many BootNotifications the charger has sent, or 0."""
+        _cp_id, _m, cp, _n = self._get_metrics(id)
+        return int(getattr(cp, "charger_generation", 0) or 0) if cp else 0
+
+    def session_limit_available(self, id: str, connector_id: int) -> bool:
+        """Whether a connector's session limit can be set right now.
+
+        The charger must be up with SmartCharging, the connector must read
+        Charging or Suspended, a transaction id must be displayed, and on 1.6
+        the connector must not be held after an unattributed stop. The charger
+        itself rejects a TxProfile whose transaction id no longer matches, so
+        this is a filter, not a guarantee.
+        """
+        cp_id, m, cp, _n = self._get_metrics(id)
+        if cp is None or cp.status != STATE_OK:
+            return False
+        if not bool(cp.supported_features & prof.SMART):
+            return False
+        conn = self._norm_conn(connector_id)
+        status_val = None
+        with contextlib.suppress(Exception):
+            status_val = m[(conn, cstat.status_connector)].value
+        if _norm(str(status_val or "")) not in {
+            "charging",
+            "suspendedev",
+            "suspendedevse",
+        }:
+            return False
+        if self.session_transaction_id(id, conn) is None:
+            return False
+        unsafe = getattr(cp, "transaction_is_unsafe", None)
+        if unsafe is not None and unsafe(conn):
+            return False
+        return True
+
+    async def set_session_charge_rate_amps(
+        self,
+        id: str,
+        connector_id: int,
+        value: float,
+    ) -> bool:
+        """Set a connector's session limit; the maximum is a limit like any other."""
+        cp_id = self.cpids.get(id, id)
+        cp = self.charge_points.get(cp_id)
+        if cp is None:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="unavailable",
+                translation_placeholders={"message": id},
+            )
+        return await cp.set_session_limit(int(connector_id), float(value))
+
+    def session_default_limit_available(self, id: str, connector_id: int) -> bool:
+        """Whether a connector's default session limit can be set right now.
+
+        The charger must be up with SmartCharging and have said where the
+        connector's profile goes. A TxDefaultProfile needs no transaction, so
+        the connector's status does not matter. The charge point checks the
+        target again before sending.
+        """
+        _cp_id, _m, cp, _n = self._get_metrics(id)
+        if cp is None or cp.status != STATE_OK:
+            return False
+        if not bool(cp.supported_features & prof.SMART):
+            return False
+        return bool(cp.session_default_target_known(self._norm_conn(connector_id)))
+
+    async def set_session_default_charge_rate_amps(
+        self,
+        id: str,
+        connector_id: int,
+        value: float,
+    ) -> bool:
+        """Set a connector's default session limit."""
+        cp_id = self.cpids.get(id, id)
+        cp = self.charge_points.get(cp_id)
+        if cp is None:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="unavailable",
+                translation_placeholders={"message": id},
+            )
+        return await cp.set_session_default_limit(int(connector_id), float(value))
+
     async def set_max_charge_rate_amps(
         self, id: str, value: float, connector_id: int = 0
     ):
-        """Set the maximum charge rate in amps."""
+        """Set the station maximum in amps; connector_id is retained but unused."""
         # allow id to be either cpid or cp_id
         cp_id = self.cpids.get(id, id)
 
         if cp_id in self.charge_points:
-            return await self.charge_points[cp_id].set_charge_rate(
-                limit_amps=value, conn_id=connector_id
+            return await self.charge_points[cp_id].set_station_charge_rate(
+                limit_amps=value
             )
         return False
 
@@ -700,11 +890,23 @@ class CentralSystem:
         """Check charger is available before executing service with Decorator."""
 
         async def wrapper(self, call, *args, **kwargs):
-            try:
-                cp_id = self.cpids.get(call.data["devid"], call.data["devid"])
-                cp = self.charge_points[cp_id]
-            except KeyError:
-                cp = list(self.charge_points.values())[0]
+            devid = call.data.get("devid") or ""
+            # Accept either the HA charger id (cpid) or the OCPP charger id (cp_id).
+            cp_id = self.cpids.get(devid, devid)
+            cp = self.charge_points.get(cp_id)
+            if cp is None:
+                # An omitted devid still falls back to a charge point of this
+                # instance, which is what legacy service calls relied on. A
+                # devid that was supplied and did not match is an error: the
+                # caller named a charger, so running the action against a
+                # different one would be worse than failing.
+                if devid or not self.charge_points:
+                    raise HomeAssistantError(
+                        translation_domain=DOMAIN,
+                        translation_key="not_found",
+                        translation_placeholders={"message": devid},
+                    )
+                cp_id, cp = next(iter(self.charge_points.items()))
             if cp.status == STATE_UNAVAILABLE:
                 _LOGGER.warning(f"{cp_id}: charger is currently unavailable")
                 raise HomeAssistantError(
@@ -726,7 +928,8 @@ class CentralSystem:
     @check_charger_available
     async def handle_clear_profile(self, call, cp):
         """Handle the clear profile service call."""
-        await cp.clear_profile()
+        conn_id = call.data.get("conn_id")
+        await cp.clear_profile(conn_id=conn_id)
 
     @check_charger_available
     async def handle_update_firmware(self, call, cp):
@@ -751,20 +954,18 @@ class CentralSystem:
 
     @check_charger_available
     async def handle_set_charge_rate(self, call, cp):
-        """Handle the data transfer service call."""
+        """Handle the charge-rate service call."""
         amps = call.data.get("limit_amps", None)
         watts = call.data.get("limit_watts", None)
-        id = call.data.get("conn_id", 0)
+        conn_id = call.data.get("conn_id", 0)
         custom_profile = call.data.get("custom_profile", None)
         if custom_profile is not None:
-            if type(custom_profile) is str:
-                custom_profile = custom_profile.replace("'", '"')
-                custom_profile = json.loads(custom_profile)
-            await cp.set_charge_rate(profile=custom_profile, conn_id=id)
+            profile = _parse_custom_profile(custom_profile, cp.id)
+            await cp.set_charge_rate(profile=profile, conn_id=conn_id)
         elif watts is not None:
-            await cp.set_charge_rate(limit_watts=watts, conn_id=id)
+            await cp.set_charge_rate(limit_watts=watts, conn_id=conn_id)
         elif amps is not None:
-            await cp.set_charge_rate(limit_amps=amps, conn_id=id)
+            await cp.set_charge_rate(limit_amps=amps, conn_id=conn_id)
 
     @check_charger_available
     async def handle_configure(self, call, cp) -> ServiceResponse:
