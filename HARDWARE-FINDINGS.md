@@ -1,4 +1,4 @@
-# SyncEV EVSC7S (SL320S647) — live OCPP 1.6 characterisation
+# SyncEV EVSC7S — live OCPP 1.6 characterisation
 
 Tested 2026-08-10, 15:05–15:22 BST, against **vanilla upstream v0.10.18** with an
 active transaction (`1786370988`) and a VW ID.3 attached. evcc disabled for the
@@ -58,7 +58,7 @@ kind (citing lbbrhzn/ocpp#1565, which does not apply here).
 ```python
 # ChargeProfileMaxStackLevel is an exclusive bound on this charger: the
 # advertised value itself is rejected with NotSupported for every profile
-# purpose. Verified on SL320S647 2026-08-10 (max=5: levels 0-4 accepted,
+# purpose. Verified on the EVSC7S 2026-08-10 (max=5: levels 0-4 accepted,
 # 5 rejected). Clamping instead of hardcoding 0 keeps the priority ordering
 # between purposes available on chargers that honour it.
 stack_level = max(0, reported_max - 1)

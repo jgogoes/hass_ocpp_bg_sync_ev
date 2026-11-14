@@ -126,7 +126,7 @@ SWITCHES: Final[list[OcppSwitchDescription]] = [
         key="get_ct_clamp_value",
         name="Enable CT Clamp",
         icon="mdi:gauge",
-        # Verified on SL320S647 2026-08-10: writing 0 stops the vendor
+        # Verified on the EVSC7S 2026-08-10: writing 0 stops the vendor
         # DataTransfer stream outright, writing 1 resumes it within ~30s.
         # The readings arrive as a DataTransfer push, parsed in ocppv16.py.
         default_state=False,
@@ -138,7 +138,7 @@ SWITCHES: Final[list[OcppSwitchDescription]] = [
         key="charge_on_plug_in",
         name="Charge When Plugged In (No Server Required)",
         icon="mdi:ev-plug-type2",
-        # Vendor key "ChargerMode". Confirmed by live test on SL320S647
+        # Vendor key "ChargerMode". Confirmed by live test on the EVSC7S
         # 2026-08-10: with the value written to 3, physically unplugging and
         # replugging the car produced an unprompted StartTransaction from the
         # charger with idTag "freeIdTag" and no RemoteStartTransaction from
@@ -164,7 +164,7 @@ SWITCHES: Final[list[OcppSwitchDescription]] = [
 # Switch keys removed from SWITCHES above. Their entity registry entries are
 # cleaned up on setup so they do not linger as permanently unavailable.
 #
-# All four were verified against a live GetConfiguration on SL320S647
+# All four were verified against a live GetConfiguration on the EVSC7S
 # (2026-08-10):
 #   StopTransactionOnEVSideDisconnect  readonly: true
 #   StopTransactionOnInvalidId         readonly: true
@@ -384,7 +384,7 @@ class ChargePointSwitch(SwitchEntity):
     def _apply_readback(self, actual: str | None) -> None:
         """Reconcile switch state with what the charger actually reports.
 
-        Vendor keys do not always report back what was written. On SL320S647,
+        Vendor keys do not always report back what was written. On the EVSC7S,
         ChargerMode set to 3 reads back as 2 even though the mode genuinely
         took effect (verified by an unprompted StartTransaction on plug-in).
         So a mismatch is not evidence the write failed, and for keys flagged

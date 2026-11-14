@@ -952,7 +952,7 @@ class ChargePoint(cp):
     def is_sync_charger(self) -> bool:
         """Return True for a Sync Energy / BG Sync EV charger.
 
-        BG Sync fork: matched on the reported vendor (SL320S647 reports
+        BG Sync fork: matched on the reported vendor (the EVSC7S reports
         "Sync Energy"), with the known model list as a second check.
         """
         vendor = self._metrics[(0, cdet.vendor.value)].value

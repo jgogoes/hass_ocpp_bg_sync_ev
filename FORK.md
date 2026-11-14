@@ -2,7 +2,7 @@
 
 A fork of [lbbrhzn/ocpp](https://github.com/lbbrhzn/ocpp) carrying fixes for
 **SyncEV / Sync Energy** chargers, developed against a **SyncEV EVSC7S**
-(serial `SL320S647`, firmware `RD0045-V1.02-S1.01`) driven by evcc.
+(firmware `RD0045-V1.02-S1.01`) driven by evcc.
 
 **Base: upstream `main` at `c514238` (2026-11-11, after `v0.12.3`).** Every
 change is additive or a narrowly scoped fix; no upstream behaviour is removed
