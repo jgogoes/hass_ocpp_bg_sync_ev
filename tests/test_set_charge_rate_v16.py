@@ -9,20 +9,32 @@ the collaborators set_charge_rate depends on:
 They avoid any parallel/dummy implementation of ChargePoint.
 """
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
-
-from custom_components.ocpp.ocppv16 import ChargePoint as ChargePointv16
-from custom_components.ocpp.enums import (
-    Profiles as prof,
-    ConfigurationKey as ckey,
-)
 from ocpp.v16.enums import (
-    ChargingProfileStatus,
-    ChargingProfilePurposeType,
     ChargingProfileKindType,
+    ChargingProfilePurposeType,
+    ChargingProfileStatus,
     ChargingRateUnitType,
+    Measurand,
+)
+
+from custom_components.ocpp.chargepoint import (
+    Metric,
+    _ConnectorAwareMetrics,
+)
+from custom_components.ocpp.const import DEFAULT_MAX_CURRENT
+from custom_components.ocpp.enums import (
+    ConfigurationKey as ckey,
+    HAChargerSession as csess,
+    OcppMisc as om,
+    Profiles as prof,
+)
+from custom_components.ocpp.ocppv16 import (
+    ChargePoint as ChargePointv16,
+    _allowed_charging_rate_units,
 )
 
 
@@ -38,6 +50,17 @@ def cp_v16():
     cp._ocpp_version = "1.6"
     cp.active_transaction_id = 0
     cp._active_tx = {}
+    cp._tx_indeterminate = set()
+    cp._accepted_stack_levels = set()
+    cp._rate_units = None
+    cp._max_stack_level = None
+    cp._smart_charging_lock = asyncio.Lock()
+    cp._metrics = _ConnectorAwareMetrics()
+    cp.settings = SimpleNamespace(
+        charge_point_max_profile_absolute=False,
+        stack_level_below_max=False,
+        three_phase_supply=False,
+    )
     # set_charge_rate calls these (we’ll monkeypatch per-test):
     # - cp.get_configuration(key)
     # - cp.call(req)
@@ -86,6 +109,43 @@ async def test_custom_profile_path_exception_triggers_notify_and_returns_false(
 
 
 @pytest.mark.asyncio
+async def test_custom_profile_rejected_status_returns_false_without_notify(
+    cp_v16, monkeypatch, caplog
+):
+    """A custom profile the charger answers Rejected returns False and logs, without a notification."""
+    notices = []
+
+    async def fake_notify(msg, title="Ocpp integration"):
+        notices.append(msg)
+        return True
+
+    async def fake_call(_req):
+        return SimpleNamespace(status=ChargingProfileStatus.rejected.value)
+
+    async def fake_get_conf(_key):
+        pytest.fail("get_configuration should not be called for custom profile")
+
+    monkeypatch.setattr(cp_v16, "notify_ha", fake_notify)
+    monkeypatch.setattr(cp_v16, "call", fake_call)
+    monkeypatch.setattr(cp_v16, "get_configuration", fake_get_conf)
+
+    profile = {
+        "chargingProfileId": 123,
+        "stackLevel": 1,
+        "chargingProfileKind": ChargingProfileKindType.relative.value,
+        "chargingProfilePurpose": ChargingProfilePurposeType.charge_point_max_profile.value,
+        "chargingSchedule": {
+            "chargingRateUnit": ChargingRateUnitType.amps.value,
+            "chargingSchedulePeriod": [{"startPeriod": 0, "limit": 16}],
+        },
+    }
+
+    assert await cp_v16.set_charge_rate(profile=profile, conn_id=2) is False
+    assert notices == []
+    assert "Custom SetChargingProfile rejected: Rejected" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_smart_charging_not_supported_returns_false_no_notify(
     cp_v16, monkeypatch
 ):
@@ -122,9 +182,9 @@ async def test_cpmax_exception_falls_back_to_txdefault_accepted_returns_true(
 
     # Allow both A and stack level
     async def fake_get_conf(key: str):
-        if key == ckey.charging_schedule_allowed_charging_rate_unit.value:
+        if key == ckey.charging_schedule_allowed_charging_rate_unit:
             return "Current"  # supports Amps
-        if key == ckey.charge_profile_max_stack_level.value:
+        if key == ckey.charge_profile_max_stack_level:
             return "2"
         pytest.fail(f"Unexpected get_configuration key: {key}")
 
@@ -158,9 +218,9 @@ async def test_cpmax_rejected_txdefault_accepted_returns_true(cp_v16, monkeypatc
     """4) CPMax rejected -> TxDefault accepted -> return True."""
 
     async def fake_get_conf(key: str):
-        if key == ckey.charging_schedule_allowed_charging_rate_unit.value:
+        if key == ckey.charging_schedule_allowed_charging_rate_unit:
             return "Current"
-        if key == ckey.charge_profile_max_stack_level.value:
+        if key == ckey.charge_profile_max_stack_level:
             return "3"
         pytest.fail(f"Unexpected get_configuration key: {key}")
 
@@ -185,3 +245,913 @@ async def test_cpmax_rejected_txdefault_accepted_returns_true(cp_v16, monkeypatc
     ok = await cp_v16.set_charge_rate(limit_amps=10, conn_id=2)
     assert ok is True
     assert notices == []
+
+
+def test_station_charge_rate_request_relative_by_default(cp_v16):
+    """Default settings keep the ChargePointMaxProfile relative, with no startSchedule."""
+    req = cp_v16._station_charge_rate_request(ChargingRateUnitType.amps.value, 16, 1)
+    profile = req.cs_charging_profiles
+    assert profile[om.charging_profile_kind] == ChargingProfileKindType.relative.value
+    assert om.start_schedule not in profile[om.charging_schedule]
+
+
+def test_station_charge_rate_request_absolute_when_enabled(cp_v16):
+    """The advanced option anchors the ChargePointMaxProfile at a fixed absolute start.
+
+    Some chargers (e.g. Autel MaxiCharger) reject a relative
+    ChargePointMaxProfile outright; this lets a user opt into the absolute
+    form those chargers accept.
+    """
+    cp_v16.settings.charge_point_max_profile_absolute = True
+    req = cp_v16._station_charge_rate_request(ChargingRateUnitType.amps.value, 16, 1)
+    profile = req.cs_charging_profiles
+    assert profile[om.charging_profile_kind] == ChargingProfileKindType.absolute.value
+    assert profile[om.charging_schedule][om.start_schedule] == "2020-01-01T00:00:00Z"
+
+
+def test_allowed_charging_rate_units_tokens():
+    """Chargers report Current/Power, A/W, or mixed, with inconsistent case."""
+    assert _allowed_charging_rate_units(None) == (True, False)
+    assert _allowed_charging_rate_units("") == (True, False)
+    assert _allowed_charging_rate_units("Unknown") == (True, False)
+    assert _allowed_charging_rate_units("Current") == (True, False)
+    assert _allowed_charging_rate_units("power") == (False, True)
+    assert _allowed_charging_rate_units("Power") == (False, True)
+    assert _allowed_charging_rate_units("A") == (True, False)
+    assert _allowed_charging_rate_units("W") == (False, True)
+    assert _allowed_charging_rate_units("Current,Power") == (True, True)
+    assert _allowed_charging_rate_units("Current, Power") == (True, True)
+
+
+def _schedule_limit(req):
+    profile = req.cs_charging_profiles
+    schedule = profile[om.charging_schedule]
+    period = schedule[om.charging_schedule_period][0]
+    return schedule[om.charging_rate_unit], period[om.limit]
+
+
+async def _accept_first_profile(cp, monkeypatch, units: str):
+    captured = []
+
+    async def fake_get_conf(key: str):
+        if key == ckey.charging_schedule_allowed_charging_rate_unit:
+            return units
+        if key == ckey.charge_profile_max_stack_level:
+            return "1"
+        pytest.fail(f"Unexpected get_configuration key: {key}")
+
+    async def fake_call(req, **_kwargs):
+        captured.append(req)
+        return SimpleNamespace(status=ChargingProfileStatus.accepted)
+
+    monkeypatch.setattr(cp, "get_configuration", fake_get_conf)
+    monkeypatch.setattr(cp, "call", fake_call)
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_power_only_charger_converts_slider_amps_to_watts(cp_v16, monkeypatch):
+    """number.*_maximum_current sends amps; watt-only chargers must get watts.
+
+    Regression for Huawei FusionCharge (ChargingScheduleAllowedChargingRateUnit=power):
+    the slider used to send the default 22000 W, so the car never slowed down.
+    """
+    captured = await _accept_first_profile(cp_v16, monkeypatch, "power")
+    voltage = Metric(230.0, "V")
+    voltage.extra_attr = {"L1-N": 230.0, "L2-N": 230.0, "L3-N": 230.0}
+    cp_v16._metrics[(1, Measurand.voltage.value)] = voltage
+
+    ok = await cp_v16.set_charge_rate(limit_amps=16, conn_id=1)
+    assert ok is True
+    unit, limit = _schedule_limit(captured[0])
+    assert unit == ChargingRateUnitType.watts.value
+    assert limit == 11040.0  # 16 A * 230 V * 3 phases
+
+
+@pytest.mark.asyncio
+async def test_power_only_charger_does_not_send_default_22000_w(cp_v16, monkeypatch):
+    """Without conversion the charger accepted 22000 W and kept offering 32 A."""
+    captured = await _accept_first_profile(cp_v16, monkeypatch, "Power")
+
+    ok = await cp_v16.set_charge_rate(limit_amps=10, conn_id=1)
+    assert ok is True
+    unit, limit = _schedule_limit(captured[0])
+    assert unit == ChargingRateUnitType.watts.value
+    assert limit == 2300.0  # 10 A * 230 V * 1 conservative default phase
+    assert limit != 22000
+
+
+@pytest.mark.asyncio
+async def test_power_only_single_phase_uses_one_phase(cp_v16, monkeypatch):
+    """A single L1-N voltage sample must convert as 1-phase, not 3-phase."""
+    captured = await _accept_first_profile(cp_v16, monkeypatch, "power")
+    voltage = Metric(230.0, "V")
+    voltage.extra_attr = {"L1-N": 230.0}
+    cp_v16._metrics[(1, Measurand.voltage.value)] = voltage
+
+    ok = await cp_v16.set_charge_rate(limit_amps=16, conn_id=1)
+    assert ok is True
+    unit, limit = _schedule_limit(captured[0])
+    assert unit == ChargingRateUnitType.watts.value
+    assert limit == 3680.0  # 16 A * 230 V * 1 phase
+
+
+@pytest.mark.asyncio
+async def test_power_only_single_phase_ignores_zero_phase_placeholders(
+    cp_v16, monkeypatch
+):
+    """Zero-valued L2/L3 placeholders must not make a charger three-phase."""
+    captured = await _accept_first_profile(cp_v16, monkeypatch, "power")
+    voltage = Metric(230.0, "V")
+    voltage.extra_attr = {"L1-N": 230.0, "L2-N": 0.0, "L3-N": 0.0}
+    current = Metric(16.0, "A")
+    current.extra_attr = {"L1": 16.0, "L2": 0.0, "L3": 0.0}
+    cp_v16._metrics[(1, Measurand.voltage.value)] = voltage
+    cp_v16._metrics[(1, Measurand.current_import.value)] = current
+
+    ok = await cp_v16.set_charge_rate(limit_amps=16, conn_id=1)
+    assert ok is True
+    unit, limit = _schedule_limit(captured[0])
+    assert unit == ChargingRateUnitType.watts.value
+    assert limit == 3680.0  # 16 A * 230 V * 1 active phase
+
+
+@pytest.mark.asyncio
+async def test_three_phase_option_converts_before_meter_values_arrive(
+    cp_v16, monkeypatch
+):
+    """Regression for #2224: a Huawei SCharger-22KT after a restart.
+
+    With no per-phase meter values yet, 16 A went out as 3680 W, below what
+    the charger charges at on three phases, so it ended every session.
+    """
+    captured = await _accept_first_profile(cp_v16, monkeypatch, "Power")
+    cp_v16.settings.three_phase_supply = True
+
+    assert await cp_v16.set_station_charge_rate(16) is True
+
+    unit, limit = _schedule_limit(captured[0])
+    assert unit == ChargingRateUnitType.watts.value
+    assert limit == 11040.0  # 16 A * 230 V * 3 phases
+
+
+@pytest.mark.parametrize(
+    ("measurand", "unit", "phase_values"),
+    [
+        (Measurand.voltage.value, "V", {"L1-N": 230.0, "L2-N": 0.0, "L3-N": 0.0}),
+        (Measurand.current_import.value, "A", {"L1": 0.4, "L2": 0.0, "L3": 0.0}),
+    ],
+    ids=["one_phase_voltage", "residual_draw_on_l1"],
+)
+@pytest.mark.asyncio
+async def test_three_phase_option_wins_over_one_phase_meter_values(
+    cp_v16, monkeypatch, measurand, unit, phase_values
+):
+    """A one-phase reading doesn't bring #2224 back with the option on."""
+    captured = await _accept_first_profile(cp_v16, monkeypatch, "Power")
+    cp_v16.settings.three_phase_supply = True
+    metric = Metric(phase_values["L1-N" if unit == "V" else "L1"], unit)
+    metric.extra_attr = phase_values
+    cp_v16._metrics[(1, measurand)] = metric
+
+    assert await cp_v16.set_charge_rate(limit_amps=16, conn_id=1) is True
+
+    assert _schedule_limit(captured[0])[1] == 11040.0
+
+
+@pytest.mark.asyncio
+async def test_three_phase_option_splits_watts_for_a_current_charger(
+    cp_v16, monkeypatch
+):
+    """Watts sent to a three-phase current-only charger are split over three."""
+    captured = await _accept_first_profile(cp_v16, monkeypatch, "Current")
+    cp_v16.settings.three_phase_supply = True
+
+    assert await cp_v16.set_charge_rate(limit_watts=11040, conn_id=1) is True
+
+    assert _schedule_limit(captured[0]) == (ChargingRateUnitType.amps.value, 16.0)
+
+
+def test_phase_count_defaults_to_one_when_all_phase_values_are_zero(cp_v16):
+    """An idle placeholder-only sample keeps the conservative one-phase default."""
+    current = Metric(0.0, "A")
+    current.extra_attr = {"L1": 0.0, "L2": 0.0, "L3": 0.0}
+    cp_v16._metrics[(1, Measurand.current_import.value)] = current
+
+    assert cp_v16._phase_count(1) == 1
+
+
+@pytest.mark.asyncio
+async def test_power_only_ignores_uncorrelated_cached_power_and_current(
+    cp_v16, monkeypatch
+):
+    """Do not infer W/A from leftover Power.Offered and Current.Offered."""
+    captured = await _accept_first_profile(cp_v16, monkeypatch, "power")
+    cp_v16._metrics[(1, Measurand.power_offered.value)] = Metric(22.0, "kW")
+    cp_v16._metrics[(1, Measurand.current_offered.value)] = Metric(16.0, "A")
+
+    ok = await cp_v16.set_charge_rate(limit_amps=10, conn_id=1)
+    assert ok is True
+    unit, limit = _schedule_limit(captured[0])
+    assert unit == ChargingRateUnitType.watts.value
+    assert limit == 2300.0
+
+
+@pytest.mark.asyncio
+async def test_power_only_does_not_use_another_connectors_metrics(cp_v16, monkeypatch):
+    """Connector 2 must not inherit connector 1 voltage or phase count."""
+    captured = await _accept_first_profile(cp_v16, monkeypatch, "power")
+    connector_1_voltage = Metric(400.0, "V")
+    connector_1_voltage.extra_attr = {
+        "L1-N": 230.0,
+        "L2-N": 230.0,
+        "L3-N": 230.0,
+    }
+    cp_v16._metrics[(1, Measurand.voltage.value)] = connector_1_voltage
+
+    ok = await cp_v16.set_charge_rate(limit_amps=10, conn_id=2)
+    assert ok is True
+    unit, limit = _schedule_limit(captured[0])
+    assert unit == ChargingRateUnitType.watts.value
+    assert limit == 2300.0
+
+
+@pytest.mark.asyncio
+async def test_power_only_limit_watts_passthrough(cp_v16, monkeypatch):
+    """An explicit watt limit is sent unchanged to a Power-only charger."""
+    captured = await _accept_first_profile(cp_v16, monkeypatch, "power")
+
+    ok = await cp_v16.set_charge_rate(limit_watts=5000, conn_id=1)
+    assert ok is True
+    unit, limit = _schedule_limit(captured[0])
+    assert unit == ChargingRateUnitType.watts.value
+    assert limit == 5000.0
+
+
+@pytest.mark.asyncio
+async def test_current_only_still_sends_amps(cp_v16, monkeypatch):
+    """Amp-capable chargers keep receiving the slider value in amps."""
+    captured = await _accept_first_profile(cp_v16, monkeypatch, "Current")
+
+    ok = await cp_v16.set_charge_rate(limit_amps=16, conn_id=1)
+    assert ok is True
+    unit, limit = _schedule_limit(captured[0])
+    assert unit == ChargingRateUnitType.amps.value
+    assert limit == 16.0
+
+
+@pytest.mark.asyncio
+async def test_current_only_converts_watts_to_amps(cp_v16, monkeypatch):
+    """A watt service call is converted when the charger only accepts amps."""
+    captured = await _accept_first_profile(cp_v16, monkeypatch, "Current")
+    voltage = Metric(230.0, "V")
+    voltage.extra_attr = {"L1-N": 230.0}
+    cp_v16._metrics[(1, Measurand.voltage.value)] = voltage
+
+    ok = await cp_v16.set_charge_rate(limit_watts=4600, conn_id=1)
+    assert ok is True
+    unit, limit = _schedule_limit(captured[0])
+    assert unit == ChargingRateUnitType.amps.value
+    assert limit == 20.0  # 4600 W / (230 V * 1 phase)
+
+
+@pytest.mark.asyncio
+async def test_unknown_rate_unit_defaults_to_current(cp_v16, monkeypatch):
+    """Unrecognized ChargingScheduleAllowedChargingRateUnit falls back to amps."""
+    captured = await _accept_first_profile(cp_v16, monkeypatch, "Unknown")
+
+    ok = await cp_v16.set_charge_rate(limit_watts=2300, conn_id=1)
+    assert ok is True
+    unit, limit = _schedule_limit(captured[0])
+    assert unit == ChargingRateUnitType.amps.value
+    assert limit == 10.0
+
+
+def test_lookup_metric_without_metrics_returns_none(cp_v16):
+    """A ChargePoint with no metric store must not raise."""
+    cp_v16._metrics = None
+    assert cp_v16._lookup_metric(Measurand.voltage.value, 1) is None
+
+
+def test_lookup_metric_invalid_connector_falls_back_to_one(cp_v16):
+    """A non-integer connector id is treated as connector 1."""
+    voltage = Metric(240.0, "V")
+    cp_v16._metrics[(1, Measurand.voltage.value)] = voltage
+    assert cp_v16._lookup_metric(Measurand.voltage.value, "bad") is voltage
+
+
+def test_lookup_metric_skips_empty_values(cp_v16):
+    """A present metric with no value is ignored."""
+    cp_v16._metrics[(1, Measurand.voltage.value)] = Metric(None, "V")
+    assert cp_v16._lookup_metric(Measurand.voltage.value, 1) is None
+
+
+def test_line_voltage_rejects_non_numeric_and_out_of_range(cp_v16):
+    """Implausible voltages fall back to 230 V."""
+    cp_v16._metrics[(1, Measurand.voltage.value)] = Metric("n/a", "V")
+    assert cp_v16._line_voltage(1) == 230.0
+    cp_v16._metrics[(1, Measurand.voltage.value)] = Metric(12.0, "V")
+    assert cp_v16._line_voltage(1) == 230.0
+
+
+def test_watts_to_amps_zero_denominator_uses_default(cp_v16, monkeypatch):
+    """A zero volt-amp product must not divide by zero."""
+    monkeypatch.setattr(cp_v16, "_line_voltage", lambda _conn: 0.0)
+    monkeypatch.setattr(cp_v16, "_phase_count", lambda _conn: 0)
+    assert cp_v16._watts_to_amps(5000, 1) == float(DEFAULT_MAX_CURRENT)
+
+
+@pytest.mark.asyncio
+async def test_amp_charger_default_limit_when_no_value_given(cp_v16, monkeypatch):
+    """Calling set_charge_rate() with no limit uses the default amp cap."""
+    captured = await _accept_first_profile(cp_v16, monkeypatch, "Current")
+
+    assert await cp_v16.set_charge_rate() is True
+    unit, limit = _schedule_limit(captured[0])
+    assert unit == ChargingRateUnitType.amps.value
+    assert limit == float(DEFAULT_MAX_CURRENT)
+
+
+@pytest.mark.asyncio
+async def test_power_charger_default_limit_when_no_value_given(cp_v16, monkeypatch):
+    """Calling set_charge_rate() with no limit uses the default watt cap."""
+    captured = await _accept_first_profile(cp_v16, monkeypatch, "Power")
+
+    assert await cp_v16.set_charge_rate() is True
+    unit, limit = _schedule_limit(captured[0])
+    assert unit == ChargingRateUnitType.watts.value
+    assert limit == 22000.0
+
+
+@pytest.mark.asyncio
+async def test_dual_unit_charger_sends_explicit_watts(cp_v16, monkeypatch):
+    """When both units are allowed, an explicit watt limit stays in watts."""
+    captured = await _accept_first_profile(cp_v16, monkeypatch, "Current,Power")
+
+    assert await cp_v16.set_charge_rate(limit_watts=7000, conn_id=1) is True
+    unit, limit = _schedule_limit(captured[0])
+    assert unit == ChargingRateUnitType.watts.value
+    assert limit == 7000.0
+
+
+def test_phase_count_ignores_phase_values_that_are_not_numbers(cp_v16):
+    """A placeholder string in one phase cannot break the count of the others."""
+    voltage = Metric(230.0, "V")
+    voltage.extra_attr = {"L1-N": 230.0, "L2-N": "n/a", "L3-N": 231.0}
+    cp_v16._metrics[(1, Measurand.voltage.value)] = voltage
+    assert cp_v16._phase_count(1) == 2
+
+
+@pytest.mark.asyncio
+async def test_power_only_session_conversion_exposes_its_assumptions(
+    cp_v16, monkeypatch
+):
+    """An amp slider converted to watts reports the voltage and phase count."""
+
+    async def configuration(key):
+        if key == ckey.charging_schedule_allowed_charging_rate_unit:
+            return "Power"
+        if key == ckey.charge_profile_max_stack_level:
+            return "2"
+        return None
+
+    monkeypatch.setattr(cp_v16, "get_configuration", configuration)
+    prepared = await cp_v16.prepare_session_limit(1, 16)
+
+    assert prepared["unit"] == "W"
+    assert prepared["value"] == 3680
+    assert prepared["stack_level"] == 2
+    assert prepared["conversion_voltage"] == 230
+    assert prepared["conversion_phases"] == 1
+
+
+def test_session_request_builders_v16(cp_v16):
+    """The 1.6 builders address exactly the id, connector and transaction given."""
+    request = cp_v16.build_session_limit_request(
+        2, 77, 3002, {"unit": "A", "value": 12.0, "stack_level": 8}
+    )
+    assert request.connector_id == 2
+    profile = request.cs_charging_profiles
+    assert profile["chargingProfileId"] == 3002
+    assert profile["stackLevel"] == 8
+    assert profile["transactionId"] == 77
+    assert profile["chargingProfileKind"] == "Relative"
+    assert profile["chargingProfilePurpose"] == "TxProfile"
+    assert profile["chargingSchedule"]["chargingRateUnit"] == "A"
+
+
+def _show_transaction(cp, connector_id: int, transaction_id: int) -> None:
+    """Record a transaction as the 1.6 handlers do: map and metric together."""
+    cp._active_tx[connector_id] = transaction_id
+    cp._metrics[(connector_id, csess.transaction_id)].value = transaction_id
+
+
+@pytest.mark.asyncio
+async def test_set_session_limit_v16_binds_the_active_transaction(cp_v16, monkeypatch):
+    """Only an Accepted reply confirms; everything else raises a clear error."""
+    from homeassistant.exceptions import HomeAssistantError
+    from ocpp.v16.enums import ChargingProfileStatus
+
+    async def configuration(key):
+        if key == ckey.charging_schedule_allowed_charging_rate_unit:
+            return "Current"
+        if key == ckey.charge_profile_max_stack_level:
+            return "5"
+        return None
+
+    monkeypatch.setattr(cp_v16, "get_configuration", configuration)
+    sent = []
+
+    async def accept(request):
+        sent.append(request)
+        return SimpleNamespace(status=ChargingProfileStatus.accepted)
+
+    monkeypatch.setattr(cp_v16, "call", accept)
+
+    with pytest.raises(HomeAssistantError, match="no active transaction"):
+        await cp_v16.set_session_limit(1, 10)
+    _show_transaction(cp_v16, 1, 0)  # what a StopTransaction leaves behind
+    with pytest.raises(HomeAssistantError, match="no active transaction"):
+        await cp_v16.set_session_limit(1, 10)
+    assert sent == []
+    _show_transaction(cp_v16, 1, 55)
+    cp_v16._tx_indeterminate = {1}
+    with pytest.raises(HomeAssistantError, match="settled"):
+        await cp_v16.set_session_limit(1, 10)
+    cp_v16._tx_indeterminate = set()
+
+    assert await cp_v16.set_session_limit(1, 10) is True
+    profile = sent[-1].cs_charging_profiles
+    assert (profile["chargingProfileId"], profile["transactionId"]) == (3001, 55)
+    assert profile["stackLevel"] == 5
+    assert profile["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] == 10.0
+
+    async def reject(_request):
+        return SimpleNamespace(status=ChargingProfileStatus.rejected)
+
+    monkeypatch.setattr(cp_v16, "call", reject)
+    with pytest.raises(HomeAssistantError, match="rejected"):
+        await cp_v16.set_session_limit(1, 10)
+
+    async def timeout(_request):
+        raise TimeoutError()
+
+    monkeypatch.setattr(cp_v16, "call", timeout)
+    with pytest.raises(HomeAssistantError, match="did not answer"):
+        await cp_v16.set_session_limit(1, 10)
+
+    async def broken(_request):
+        raise RuntimeError("closed")
+
+    monkeypatch.setattr(cp_v16, "call", broken)
+    with pytest.raises(HomeAssistantError, match="failed"):
+        await cp_v16.set_session_limit(1, 10)
+
+
+@pytest.mark.asyncio
+async def test_set_session_limit_v16_aborts_when_the_transaction_changes(
+    cp_v16, monkeypatch
+):
+    """A stop or new start during preparation must not get the old id's profile."""
+    from homeassistant.exceptions import HomeAssistantError
+
+    _show_transaction(cp_v16, 1, 55)
+    sent = []
+
+    async def prepare_and_stop(connector_id, amps, **_kwargs):
+        _show_transaction(cp_v16, connector_id, 0)  # StopTransaction arrived
+        return {"unit": "A", "value": float(amps), "stack_level": 1}
+
+    async def record(request):
+        sent.append(request)
+        return SimpleNamespace(status="Accepted")
+
+    monkeypatch.setattr(cp_v16, "prepare_session_limit", prepare_and_stop)
+    monkeypatch.setattr(cp_v16, "call", record)
+    with pytest.raises(HomeAssistantError, match="changed while"):
+        await cp_v16.set_session_limit(1, 10)
+    assert sent == []
+
+
+def test_session_default_request_builder_v16(cp_v16):
+    """The default profile is the action's TxDefaultProfile leg, with no transaction."""
+    request = cp_v16.build_session_default_request(
+        2, 2002, {"unit": "A", "value": 12.0, "stack_level": 5}
+    )
+    assert request.connector_id == 2
+    profile = request.cs_charging_profiles
+    assert profile["chargingProfileId"] == 2002
+    assert profile["stackLevel"] == 5
+    assert "transactionId" not in profile
+    assert profile["chargingProfileKind"] == "Relative"
+    assert profile["chargingProfilePurpose"] == "TxDefaultProfile"
+    assert profile["chargingSchedule"]["chargingSchedulePeriod"] == [
+        {"startPeriod": 0, "limit": 12.0}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_set_session_default_limit_v16_needs_no_transaction(cp_v16, monkeypatch):
+    """Only an Accepted reply confirms; everything else raises a clear error."""
+    from homeassistant.exceptions import HomeAssistantError
+
+    async def configuration(key):
+        if key == ckey.charging_schedule_allowed_charging_rate_unit:
+            return "Current"
+        if key == ckey.charge_profile_max_stack_level:
+            return "5"
+        return None
+
+    monkeypatch.setattr(cp_v16, "get_configuration", configuration)
+    sent = []
+
+    async def accept(request):
+        sent.append(request)
+        return SimpleNamespace(status=ChargingProfileStatus.accepted)
+
+    monkeypatch.setattr(cp_v16, "call", accept)
+    cp_v16._tx_indeterminate = {1}  # a held connector does not matter here
+    assert await cp_v16.set_session_default_limit(1, 10) is True
+    assert sent[-1].connector_id == 1
+    profile = sent[-1].cs_charging_profiles
+    assert (profile["chargingProfileId"], profile["stackLevel"]) == (2001, 5)
+    assert profile["chargingProfilePurpose"] == "TxDefaultProfile"
+    assert profile["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] == 10.0
+
+    async def not_supported(_request):
+        return SimpleNamespace(status="NotSupported")
+
+    monkeypatch.setattr(cp_v16, "call", not_supported)
+    with pytest.raises(HomeAssistantError, match=r"rejected .*\(NotSupported\)"):
+        await cp_v16.set_session_default_limit(1, 10)
+
+    async def timeout(_request):
+        raise TimeoutError()
+
+    monkeypatch.setattr(cp_v16, "call", timeout)
+    with pytest.raises(HomeAssistantError, match="did not answer"):
+        await cp_v16.set_session_default_limit(1, 10)
+
+    async def broken(_request):
+        raise RuntimeError("closed")
+
+    monkeypatch.setattr(cp_v16, "call", broken)
+    with pytest.raises(HomeAssistantError, match="failed: closed"):
+        await cp_v16.set_session_default_limit(1, 10)
+
+
+async def _levels_sent(cp, monkeypatch, reported):
+    """Run set_charge_rate with an active transaction; return levels per purpose.
+
+    The station ceiling is refused so the TxProfile and TxDefaultProfile legs
+    are sent too. reported is what ChargeProfileMaxStackLevel answers or an
+    exception to raise.
+    """
+    sent = {}
+
+    async def configuration(key):
+        if key == ckey.charging_schedule_allowed_charging_rate_unit:
+            return "Current"
+        if key == ckey.charge_profile_max_stack_level:
+            if isinstance(reported, Exception):
+                raise reported
+            return reported
+        pytest.fail(f"Unexpected get_configuration key: {key}")
+
+    async def record(req):
+        profile = req.cs_charging_profiles
+        sent[profile["chargingProfilePurpose"]] = profile["stackLevel"]
+        if profile["chargingProfilePurpose"] == "ChargePointMaxProfile":
+            return SimpleNamespace(status=ChargingProfileStatus.rejected)
+        return SimpleNamespace(status=ChargingProfileStatus.accepted)
+
+    monkeypatch.setattr(cp, "get_configuration", configuration)
+    monkeypatch.setattr(cp, "call", record)
+    cp._active_tx = {1: 55}
+    assert await cp.set_charge_rate(limit_amps=10, conn_id=1) is True
+    return sent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("below_max", "reported", "expected"),
+    [
+        (False, "5", 5),
+        (False, "0", 0),
+        (False, "1", 1),
+        (True, "5", 4),
+        (True, "1", 0),
+        (True, "0", 0),
+        (False, "-1", 0),
+    ],
+)
+async def test_every_managed_profile_uses_the_resolved_stack_level(
+    cp_v16, monkeypatch, below_max, reported, expected
+):
+    """Station, TxProfile and TxDefaultProfile all go out at one level.
+
+    With stack_level_below_max it is one below the reported maximum: the
+    Morek MEV11 and Timxon report 5 but accept only up to 4.
+    """
+    cp_v16.settings.stack_level_below_max = below_max
+    sent = await _levels_sent(cp_v16, monkeypatch, reported)
+    assert sent == {
+        "ChargePointMaxProfile": expected,
+        "TxProfile": expected,
+        "TxDefaultProfile": expected,
+    }
+
+
+@pytest.mark.asyncio
+async def test_session_limit_uses_the_level_below_the_maximum(cp_v16, monkeypatch):
+    """The session sliders resolve the same level as the action."""
+    cp_v16.settings.stack_level_below_max = True
+
+    async def configuration(key):
+        if key == ckey.charging_schedule_allowed_charging_rate_unit:
+            return "Current"
+        if key == ckey.charge_profile_max_stack_level:
+            return "5"
+        return None
+
+    monkeypatch.setattr(cp_v16, "get_configuration", configuration)
+    prepared = await cp_v16.prepare_session_limit(1, 16)
+    assert prepared["stack_level"] == 4
+    tx = cp_v16.build_session_limit_request(1, 55, 3001, prepared)
+    default = cp_v16.build_session_default_request(1, 2001, prepared)
+    assert tx.cs_charging_profiles["stackLevel"] == 4
+    assert default.cs_charging_profiles["stackLevel"] == 4
+
+
+_SUGGEST_OPTION = "enable 'Charger accepts only stack levels below its reported"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("below_max", "reported", "level", "suggested"),
+    [
+        (False, "5", 5, True),
+        (True, "5", 4, False),
+        (False, "0", 0, False),
+    ],
+)
+async def test_a_refused_station_ceiling_points_at_the_stack_level_option(
+    cp_v16, monkeypatch, below_max, reported, level, suggested
+):
+    """The error names the refused level and suggests the option while it is off.
+
+    At level 0 one level lower is impossible, so it is not suggested.
+    """
+    from homeassistant.exceptions import HomeAssistantError
+
+    cp_v16.settings.stack_level_below_max = below_max
+
+    async def configuration(key):
+        if key == ckey.charging_schedule_allowed_charging_rate_unit:
+            return "Current"
+        if key == ckey.charge_profile_max_stack_level:
+            return reported
+        return None
+
+    async def reject(_req, **_kwargs):
+        return SimpleNamespace(status=ChargingProfileStatus.rejected)
+
+    monkeypatch.setattr(cp_v16, "get_configuration", configuration)
+    monkeypatch.setattr(cp_v16, "call", reject)
+    with pytest.raises(HomeAssistantError) as err:
+        await cp_v16.set_station_charge_rate(16)
+    message = err.value.translation_placeholders["message"]
+    assert f"stackLevel {level}" in message
+    assert (_SUGGEST_OPTION in message) is suggested
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("default_profile", [False, True])
+async def test_a_refused_session_limit_points_at_the_stack_level_option(
+    cp_v16, monkeypatch, default_profile
+):
+    """Both session sliders name the refused level and suggest the option."""
+    from homeassistant.exceptions import HomeAssistantError
+
+    _show_transaction(cp_v16, 1, 55)
+
+    async def configuration(key):
+        if key == ckey.charging_schedule_allowed_charging_rate_unit:
+            return "Current"
+        if key == ckey.charge_profile_max_stack_level:
+            return "5"
+        return None
+
+    async def reject(_req):
+        return SimpleNamespace(status=ChargingProfileStatus.rejected)
+
+    monkeypatch.setattr(cp_v16, "get_configuration", configuration)
+    monkeypatch.setattr(cp_v16, "call", reject)
+    setter = (
+        cp_v16.set_session_default_limit
+        if default_profile
+        else cp_v16.set_session_limit
+    )
+    with pytest.raises(HomeAssistantError, match="stackLevel 5") as err:
+        await setter(1, 10)
+    assert _SUGGEST_OPTION in str(err.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status", [ChargingProfileStatus.not_supported, ChargingProfileStatus.rejected]
+)
+async def test_not_supported_also_points_at_the_stack_level_option(
+    cp_v16, monkeypatch, status
+):
+    """Chargers refuse a level they do not take with NotSupported or Rejected.
+
+    Timxon A0 and Morek MEV11 answer NotSupported at the reported maximum,
+    ABB Terra AC answers Rejected.
+    """
+    from homeassistant.exceptions import HomeAssistantError
+
+    _show_transaction(cp_v16, 1, 55)
+
+    async def configuration(key):
+        if key == ckey.charging_schedule_allowed_charging_rate_unit:
+            return "Current"
+        if key == ckey.charge_profile_max_stack_level:
+            return "5"
+        return None
+
+    async def refuse(_req):
+        return SimpleNamespace(status=status)
+
+    monkeypatch.setattr(cp_v16, "get_configuration", configuration)
+    monkeypatch.setattr(cp_v16, "call", refuse)
+    with pytest.raises(HomeAssistantError, match="stackLevel 5") as err:
+        await cp_v16.set_session_limit(1, 10)
+    assert _SUGGEST_OPTION in str(err.value)
+
+
+@pytest.mark.asyncio
+async def test_a_level_once_accepted_is_not_blamed_for_a_refusal(cp_v16, monkeypatch):
+    """After the charger accepted a profile at the level, a refusal has another cause."""
+    from homeassistant.exceptions import HomeAssistantError
+
+    _show_transaction(cp_v16, 1, 55)
+
+    async def configuration(key):
+        if key == ckey.charging_schedule_allowed_charging_rate_unit:
+            return "Current"
+        if key == ckey.charge_profile_max_stack_level:
+            return "5"
+        return None
+
+    answers = [ChargingProfileStatus.accepted, ChargingProfileStatus.rejected]
+
+    async def answer(_req, **_kwargs):
+        return SimpleNamespace(status=answers.pop(0))
+
+    monkeypatch.setattr(cp_v16, "get_configuration", configuration)
+    monkeypatch.setattr(cp_v16, "call", answer)
+    assert await cp_v16.set_station_charge_rate(16)
+    with pytest.raises(HomeAssistantError, match="stackLevel 5") as err:
+        await cp_v16.set_session_limit(1, 10)
+    assert _SUGGEST_OPTION not in str(err.value)
+
+
+def _counting_configuration(answers):
+    """Fake get_configuration answering from answers and counting reads per key.
+
+    An answer that is an exception is raised; a list is consumed one per read.
+    """
+    reads = {}
+
+    async def configuration(key):
+        reads[key] = reads.get(key, 0) + 1
+        answer = answers[key]
+        if isinstance(answer, list):
+            answer = answer.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    return configuration, reads
+
+
+_UNITS = ckey.charging_schedule_allowed_charging_rate_unit
+_STACK = ckey.charge_profile_max_stack_level
+
+
+@pytest.mark.asyncio
+async def test_configuration_is_read_once_across_writes(cp_v16, monkeypatch):
+    """Several writes send one GetConfiguration per key (#2148)."""
+    configuration, reads = _counting_configuration({_UNITS: "Current", _STACK: "5"})
+    monkeypatch.setattr(cp_v16, "get_configuration", configuration)
+    for amps in (6, 10, 16):
+        assert await cp_v16._resolve_charge_rate(amps, None, 0) == ("A", amps, 5)
+    assert reads == {_UNITS: 1, _STACK: 1}
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_first_writes_read_once(cp_v16, monkeypatch):
+    """A second write waits for the first one's answer instead of reading again."""
+    release = asyncio.Event()
+    reads = {}
+
+    async def configuration(key):
+        reads[key] = reads.get(key, 0) + 1
+        await release.wait()
+        return {_UNITS: "Power", _STACK: "3"}[key]
+
+    monkeypatch.setattr(cp_v16, "get_configuration", configuration)
+    writes = [
+        asyncio.create_task(cp_v16._resolve_charge_rate(None, watts, 0))
+        for watts in (7000, 8000)
+    ]
+    await asyncio.sleep(0)
+    release.set()
+    assert await asyncio.gather(*writes) == [("W", 7000, 3), ("W", 8000, 3)]
+    assert reads == {_UNITS: 1, _STACK: 1}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_key", [_UNITS, _STACK])
+async def test_a_failed_read_fails_the_write_and_is_retried(
+    cp_v16, monkeypatch, failed_key
+):
+    """No fallback: the write fails naming the key, and the next one reads again."""
+    from homeassistant.exceptions import HomeAssistantError
+
+    answers = {_UNITS: "Current", _STACK: "5"}
+    answers[failed_key] = [TimeoutError(), answers[failed_key]]
+    configuration, reads = _counting_configuration(answers)
+    monkeypatch.setattr(cp_v16, "get_configuration", configuration)
+    with pytest.raises(HomeAssistantError, match=f"Could not read {failed_key}"):
+        await cp_v16._resolve_charge_rate(10, None, 0)
+    assert await cp_v16._resolve_charge_rate(10, None, 0) == ("A", 10, 5)
+    assert reads[failed_key] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("answer", "reads_expected"), [("Unknown", 1), ("", 2), (None, 2)]
+)
+async def test_an_unreported_rate_unit_means_amps(
+    cp_v16, monkeypatch, answer, reads_expected
+):
+    """No usable unit means Amps, as before. Only an actual answer is kept."""
+    configuration, reads = _counting_configuration({_UNITS: answer, _STACK: "5"})
+    monkeypatch.setattr(cp_v16, "get_configuration", configuration)
+    for _ in range(2):
+        assert await cp_v16._resolve_charge_rate(10, None, 0) == ("A", 10, 5)
+    assert reads[_UNITS] == reads_expected
+
+
+@pytest.mark.asyncio
+async def test_a_stack_level_that_is_not_a_number_fails_every_write(
+    cp_v16, monkeypatch
+):
+    """No guessed level, which a held profile could outrank; not asked again."""
+    from homeassistant.exceptions import HomeAssistantError
+
+    configuration, reads = _counting_configuration({_UNITS: "Current", _STACK: "5.0"})
+    monkeypatch.setattr(cp_v16, "get_configuration", configuration)
+    for _ in range(2):
+        with pytest.raises(HomeAssistantError, match="OCPP 1.6 requires a number"):
+            await cp_v16._resolve_charge_rate(10, None, 0)
+    assert reads == {_UNITS: 1, _STACK: 1}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("below_max", "expected"), [(False, 1), (True, 0)])
+async def test_an_unknown_stack_level_key_uses_level_1(
+    cp_v16, monkeypatch, caplog, below_max, expected
+):
+    """A charger without the key gets level 1, as up to 0.12.x; read once.
+
+    stack_level_below_max still applies on top, so the user can choose 0.
+    """
+    cp_v16.settings.stack_level_below_max = below_max
+    configuration, reads = _counting_configuration(
+        {_UNITS: "Current", _STACK: "Unknown"}
+    )
+    monkeypatch.setattr(cp_v16, "get_configuration", configuration)
+    for _ in range(2):
+        assert await cp_v16._resolve_charge_rate(10, None, 0) == ("A", 10, expected)
+    assert reads == {_UNITS: 1, _STACK: 1}
+    warnings = [r for r in caplog.records if "does not support" in r.message]
+    assert len(warnings) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", ["", None])
+async def test_a_stack_level_without_a_value_is_read_again(cp_v16, monkeypatch, answer):
+    """An answer without a value is not kept: the write fails, the next reads again."""
+    from homeassistant.exceptions import HomeAssistantError
+
+    configuration, reads = _counting_configuration(
+        {_UNITS: "Current", _STACK: [answer, "5"]}
+    )
+    monkeypatch.setattr(cp_v16, "get_configuration", configuration)
+    with pytest.raises(HomeAssistantError, match=f"Charger returned no {_STACK}"):
+        await cp_v16._resolve_charge_rate(10, None, 0)
+    assert await cp_v16._resolve_charge_rate(10, None, 0) == ("A", 10, 5)
+    assert reads == {_UNITS: 1, _STACK: 2}

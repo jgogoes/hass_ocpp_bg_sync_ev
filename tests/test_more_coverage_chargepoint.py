@@ -163,10 +163,11 @@ async def test_run_handles_timeout_and_other_exception(
 
             stopped = {"count": 0}
 
-            async def fake_stop():
+            async def fake_stop_session(session):
+                """Count finalization of the runner's captured session."""
                 stopped["count"] += 1
 
-            monkeypatch.setattr(srv, "stop", fake_stop, raising=True)
+            monkeypatch.setattr(srv, "_stop_session", fake_stop_session, raising=True)
 
             async def raises_timeout():
                 await asyncio.sleep(0)
@@ -218,59 +219,83 @@ async def test_update_returns_early_when_root_device_missing(
             await wait_ready(cs.charge_points[cp_id])
             srv = cs.charge_points[cp_id]
 
-            # Fake registries: no device returned.
+            # Fake registries: no device returned. The fakes implement only
+            # what update() itself touches - patching the shared helper
+            # modules swaps the registries for ALL of Home Assistant, so the
+            # patches must not outlive this block. Left installed (as they
+            # were until HA 2026.8), core's config-entry teardown hits the
+            # fakes and fails on registry surface they don't implement.
             import custom_components.ocpp.chargepoint as mod
 
             class FakeDR:
-                """Fake DR."""
+                """Fake DR: only what update()'s early-return path touches."""
 
                 def async_get_device(self, identifiers):
                     return None
 
-                def async_clear_config_entry(self, config_entry_id):
-                    return None
+                def async_get_devices(
+                    self, *, identifiers=None, connections=None, config_entry_id=None
+                ):
+                    dev = self.async_get_device(identifiers)
+                    return [dev] if dev is not None else []
 
                 @property
                 def devices(self):
                     """Fake devices."""
                     return {}
 
-                def async_update_device(self, *args, **kwargs):
-                    return None
-
-                def async_get_or_create(self, *args, **kwargs):
-                    return SimpleNamespace(id="dummy")
-
             class FakeER:
-                """Fake ER."""
-
-                def async_clear_config_entry(self, config_entry_id):
-                    return None
+                """Fake ER: only ever passed to the patched entries_for_device."""
 
             def fake_entries_for_device(_er, _dev_id):
                 # No entities to update; the loop is exercised anyway.
                 return []
 
-            # Patch HA helpers & dispatcher.
-            monkeypatch.setattr(
-                mod.device_registry, "async_get", lambda _: FakeDR(), raising=True
-            )
-            monkeypatch.setattr(
-                mod.entity_registry, "async_get", lambda _: FakeER(), raising=True
-            )
+            dispatched = []
 
-            monkeypatch.setattr(
-                mod.entity_registry,
-                "async_entries_for_device",
-                fake_entries_for_device,
-                raising=True,
+            # Patch HA helpers & dispatcher for the update() call only.
+            # Still a module-global patch while it lasts: any concurrent HA
+            # task that resolves a registry inside this await sees the fakes.
+            originals = (
+                mod.device_registry.async_get,
+                mod.entity_registry.async_get,
+                mod.entity_registry.async_entries_for_device,
+                mod.async_dispatcher_send,
             )
-            monkeypatch.setattr(
-                mod, "async_dispatcher_send", lambda *args, **kw: None, raising=True
-            )
+            with monkeypatch.context() as mp:
+                mp.setattr(
+                    mod.device_registry, "async_get", lambda _: FakeDR(), raising=True
+                )
+                mp.setattr(
+                    mod.entity_registry, "async_get", lambda _: FakeER(), raising=True
+                )
+                mp.setattr(
+                    mod.entity_registry,
+                    "async_entries_for_device",
+                    fake_entries_for_device,
+                    raising=True,
+                )
+                mp.setattr(
+                    mod,
+                    "async_dispatcher_send",
+                    lambda _hass, _sig, payload: dispatched.append(payload),
+                    raising=True,
+                )
 
-            # Should exit early without error (L602).
-            await srv.update(srv.settings.cpid)
+                # Should exit early without error (L602).
+                await srv.update(srv.settings.cpid)
+
+            # The leak guard: on the pinned harness the fakes are harmless at
+            # teardown, so nothing else fails if this scoping regresses. The
+            # helpers being restored right here is the actual contract.
+            assert originals == (
+                mod.device_registry.async_get,
+                mod.entity_registry.async_get,
+                mod.entity_registry.async_entries_for_device,
+                mod.async_dispatcher_send,
+            )
+            # Early return means no dispatch at all - not an empty one.
+            assert dispatched == []
         finally:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -316,59 +341,112 @@ async def test_update_traverses_children_and_skips_visited(
             child = Dev("child", via="root")
 
             class FakeDR:
-                """Fake DR."""
-
-                def async_clear_config_entry(self, config_entry_id):
-                    return None
-
-                def async_update_device(self, *args, **kwargs):
-                    return None
-
-                def async_get_or_create(self, *args, **kwargs):
-                    return SimpleNamespace(id="dummy")
+                """Fake DR: only what update()'s traversal touches (see above)."""
 
                 def async_get_device(self, identifiers):
                     return root
 
-                @property
-                def devices(self):
-                    # Duplicate the child to force the same ID to be appended twice -> will hit continue (L612)
-                    class Container:
-                        def values(self_inner):
-                            return [root, child, child]
-
-                    return Container()
+                def async_get_devices(
+                    self, *, identifiers=None, connections=None, config_entry_id=None
+                ):
+                    dev = self.async_get_device(identifiers)
+                    return [dev] if dev is not None else []
 
             class FakeER:
-                """Fake ER."""
+                """Fake ER: only ever passed to the patched entries_for_device."""
 
-                def async_clear_config_entry(self, config_entry_id):
-                    return None
+            def ent(entity_id, disabled_by=None):
+                return SimpleNamespace(
+                    entity_id=entity_id, disabled=False, disabled_by=disabled_by
+                )
+
+            # Each device carries one live entity plus one that a filter must
+            # drop: root's second entity is registry-disabled (but HAS a
+            # state, so only the disabled check can exclude it); child's
+            # second is enabled but never gets a state, so only the
+            # states-lookup check can exclude it.
+            ents_by_dev = {
+                "root": [
+                    ent("sensor.root_live"),
+                    ent("sensor.root_disabled", disabled_by="user"),
+                ],
+                "child": [ent("sensor.child_live"), ent("sensor.child_nostate")],
+            }
+            hass.states.async_set("sensor.root_live", "on")
+            hass.states.async_set("sensor.root_disabled", "on")
+            hass.states.async_set("sensor.child_live", "on")
+
+            entity_lookup_device_ids = []
+            dispatched = []
 
             def fake_entries_for_device(_er, _dev_id):
-                # No entities to update; the loop is exercised anyway.
-                return []
+                entity_lookup_device_ids.append(_dev_id)
+                return ents_by_dev.get(_dev_id, [])
 
-            # Patch HA helpers & dispatcher.
-            monkeypatch.setattr(
-                mod.device_registry, "async_get", lambda _: FakeDR(), raising=True
+            # Patch HA helpers & dispatcher for the update() call only -
+            # the module-level patch must not leak into entry teardown.
+            # Still a module-global patch while it lasts: any concurrent HA
+            # task that resolves a registry inside this await sees the fakes.
+            originals = (
+                mod.device_registry.async_get,
+                mod.device_registry.async_entries_for_config_entry,
+                mod.entity_registry.async_get,
+                mod.entity_registry.async_entries_for_device,
+                mod.async_dispatcher_send,
             )
-            monkeypatch.setattr(
-                mod.entity_registry, "async_get", lambda _: FakeER(), raising=True
-            )
-            monkeypatch.setattr(
-                mod.entity_registry,
-                "async_entries_for_device",
-                fake_entries_for_device,
-                raising=True,
-            )
-            monkeypatch.setattr(
-                mod, "async_dispatcher_send", lambda *args, **kw: None, raising=True
+            with monkeypatch.context() as mp:
+                mp.setattr(
+                    mod.device_registry, "async_get", lambda _: FakeDR(), raising=True
+                )
+                # Duplicate the child to force the same ID to be appended
+                # twice -> the second pop hits the visited 'continue'.
+                mp.setattr(
+                    mod.device_registry,
+                    "async_entries_for_config_entry",
+                    lambda _dr, _entry_id: [root, child, child],
+                    raising=True,
+                )
+                mp.setattr(
+                    mod.entity_registry, "async_get", lambda _: FakeER(), raising=True
+                )
+                mp.setattr(
+                    mod.entity_registry,
+                    "async_entries_for_device",
+                    fake_entries_for_device,
+                    raising=True,
+                )
+                mp.setattr(
+                    mod,
+                    "async_dispatcher_send",
+                    lambda _hass, _sig, payload: dispatched.append(payload),
+                    raising=True,
+                )
+
+                await srv.update(srv.settings.cpid)
+
+            # The leak guard: on the pinned harness the fakes are harmless at
+            # teardown, so nothing else fails if this scoping regresses. The
+            # helpers being restored right here is the actual contract.
+            assert originals == (
+                mod.device_registry.async_get,
+                mod.device_registry.async_entries_for_config_entry,
+                mod.entity_registry.async_get,
+                mod.entity_registry.async_entries_for_device,
+                mod.async_dispatcher_send,
             )
 
-            # No exceptions expected; internal traversal will append 'child' twice,
-            # so on second pop it will be in 'visited' and trigger L612 'continue'.
-            await srv.update(srv.settings.cpid)
+            # The traversal appends 'child' twice (neither copy is in
+            # 'visited' at append time); the second pop must hit the
+            # 'continue', so 'child' gets exactly one registry lookup.
+            # This lookup ORDER is a proxy for the visit order - kept
+            # because the dispatched payload is a set of entity_ids and
+            # cannot see a double visit (same ids re-added change nothing).
+            assert entity_lookup_device_ids == ["root", "child"]
+
+            # update()'s actual product: one dispatch carrying exactly the
+            # enabled-with-state entities - the disabled and stateless ones
+            # must have been dropped by their respective filters.
+            assert dispatched == [{"sensor.root_live", "sensor.child_live"}]
         finally:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -672,3 +750,88 @@ async def test_ocppv16_clean_measurands_logic():
     result_c = await CPv16.get_supported_measurands(cp)
 
     assert result_c == ""
+
+
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize(
+    "setup_config_entry",
+    [{"port": 9417, "cp_id": "CP_real_registry", "cms": "cms_services"}],
+    indirect=True,
+)
+@pytest.mark.parametrize("cp_id", ["CP_real_registry"])
+@pytest.mark.parametrize("port", [9417])
+@pytest.mark.parametrize("legacy_mapping", [False, True])
+async def test_update_real_registry_includes_child_device(
+    hass, socket_enabled, cp_id, port, setup_config_entry, legacy_mapping
+):
+    """Regression for #2227: update() walks a real registry's child devices.
+
+    Older HA exposes ``DeviceRegistry.devices`` as a mapping whose iteration
+    yields device-id strings; newer HA yields DeviceEntry. ``legacy_mapping``
+    swaps in the real underlying mapping to reproduce the older behaviour.
+    """
+    from homeassistant.helpers import device_registry as dr, entity_registry as er
+    from homeassistant.helpers.dispatcher import async_dispatcher_connect
+
+    from custom_components.ocpp.const import DATA_UPDATED, DOMAIN
+
+    cs = setup_config_entry
+    async with websockets.connect(
+        f"ws://127.0.0.1:{port}/{cp_id}", subprotocols=["ocpp1.6"]
+    ) as ws:
+        client = ChargePoint(f"{cp_id}_client", ws)
+        task = asyncio.create_task(client.start())
+        try:
+            await client.send_boot_notification()
+            await wait_ready(cs.charge_points[cp_id])
+            srv = cs.charge_points[cp_id]
+
+            # Real registries (no fakes): a connector child device linked to
+            # the charger via via_device_id, holding one live entity.
+            dev_reg = dr.async_get(hass)
+            if legacy_mapping:
+                if not hasattr(dev_reg, "_devices"):
+                    pytest.skip(
+                        "registry has no _devices: this HA's real registry is "
+                        "already legacy, so the legacy_mapping=False case "
+                        "reproduces the crash"
+                    )
+                dev_reg.devices = dev_reg._devices
+            root = next(
+                iter(
+                    dev_reg.async_get_devices(
+                        identifiers={(DOMAIN, srv.settings.cpid), (DOMAIN, srv.id)},
+                        config_entry_id=srv.entry.entry_id,
+                    )
+                )
+            )
+            child = dev_reg.async_get_or_create(
+                config_entry_id=srv.entry.entry_id,
+                identifiers={(DOMAIN, f"{srv.settings.cpid}-conn1")},
+                via_device_id=root.id,
+            )
+            ent = er.async_get(hass).async_get_or_create(
+                "sensor",
+                DOMAIN,
+                "child_unique",
+                config_entry=srv.entry,
+                device_id=child.id,
+            )
+            hass.states.async_set(ent.entity_id, "on")
+
+            dispatched = []
+            unsub = async_dispatcher_connect(
+                hass, DATA_UPDATED, lambda ids: dispatched.append(ids)
+            )
+            try:
+                await srv.update(srv.settings.cpid)
+                await hass.async_block_till_done()
+            finally:
+                unsub()
+
+            assert ent.entity_id in dispatched[-1]
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            await ws.close()

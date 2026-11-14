@@ -1,23 +1,31 @@
 """Test exceptions paths in api.py."""
 
 import contextlib
+import json
+import logging
 from types import SimpleNamespace
 
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
+from ocpp.v16.enums import ChargePointStatus
 
 from homeassistant.const import STATE_OK, STATE_UNAVAILABLE
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import template as template_helper
+from homeassistant.util.yaml.objects import NodeStrClass
 from websockets import NegotiationError
 
-from custom_components.ocpp.api import CentralSystem
+from custom_components.ocpp.api import CHRGR_SERVICE_DATA_SCHEMA, CentralSystem
 from custom_components.ocpp.const import DOMAIN
 from custom_components.ocpp.enums import (
     HAChargerServices as csvcs,
+    HAChargerSession as csess,
     HAChargerStatuses as cstat,
+    Profiles as prof,
 )
 from custom_components.ocpp.chargepoint import Metric as M
 from custom_components.ocpp.chargepoint import SetVariableResult
+from custom_components.ocpp.switch import ChargePointSwitch, SWITCHES
 
 from tests.const import MOCK_CONFIG_DATA
 
@@ -33,6 +41,11 @@ class DummyCP:
         self._metrics = {}
         # service call sinks
         self.calls = []
+
+    async def set_station_charge_rate(self, **kw):
+        """Record the station-only number route."""
+        self.calls.append(("set_station_charge_rate", kw))
+        return True
 
     # ---- services the API calls into ----
     async def set_charge_rate(self, **kw):
@@ -74,9 +87,9 @@ class DummyCP:
         )
         return True
 
-    async def clear_profile(self):
+    async def clear_profile(self, conn_id=None):
         """Clear profile."""
-        self.calls.append(("clear_profile", {}))
+        self.calls.append(("clear_profile", {"conn_id": conn_id}))
         return True
 
     async def update_firmware(self, url, delay):
@@ -116,9 +129,17 @@ def _install_dummy_cp(
     cs: CentralSystem, *, cpid="test_cpid", cp_id="CP_DUMMY", **kw
 ) -> DummyCP:
     cp = DummyCP(**kw)
+    cp.id = cp_id
     cs.charge_points[cp_id] = cp
     cs.cpids[cpid] = cp_id
     return cp
+
+
+def _available_central_system(hass) -> tuple[CentralSystem, DummyCP]:
+    """Create a central system with one available charge point."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG_DATA.copy())
+    cs = CentralSystem(hass, entry)
+    return cs, _install_dummy_cp(cs, cpid="ok", cp_id="CP_OK")
 
 
 @pytest.mark.asyncio
@@ -228,25 +249,131 @@ async def test_get_available_paths(hass):
     # Create a MockConfigEntry with existing standard config
     entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG_DATA.copy())
     cs = CentralSystem(hass, entry)
-    # charger unavailable by status for connector 0
+    # no charger with this id
+    assert cs.get_available("test_cpid") is None
+
+    # charger disconnected
     cp = _install_dummy_cp(cs, status=STATE_UNAVAILABLE)
     assert cs.get_available("test_cpid", connector_id=0) is False
 
-    # specific connector via per-connector metric, charger available
-    cp = _install_dummy_cp(cs, status=STATE_OK)
-    meas = cstat.status_connector.value
-    cp._metrics[(1, meas)] = M("Charging", None)
+    # charger connected, no connector status reported yet
+    cp.status = STATE_OK
+    assert cs.get_available("test_cpid", connector_id=0) is True
     assert cs.get_available("test_cpid", connector_id=1) is True
 
-    # via flat extra_attr aggregator
-    cp2 = _install_dummy_cp(cs, cpid="agg", cp_id="CP_AGG", status=STATE_OK)
-    flat = M("Available", None)
-    flat.extra_attr = {2: "Finishing"}
-    cp2._metrics[meas] = flat
-    assert cs.get_available("agg", connector_id=2) is True
 
-    # fall back to charger status if no info
-    assert cs.get_available("agg", connector_id=3) is True  # charger STATE_OK
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status",
+    [*(status.value for status in ChargePointStatus), "Occupied", "VendorSpecific"],
+)
+async def test_connector_status_does_not_change_availability(hass, status):
+    """Only the charger connection decides, whatever the connector reports."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG_DATA.copy())
+    cs = CentralSystem(hass, entry)
+    cp = _install_dummy_cp(cs, status=STATE_OK)
+    cp._metrics[(1, cstat.status_connector)] = M(status, None)
+
+    assert cs.get_available("test_cpid", connector_id=1) is True
+
+    cp.status = STATE_UNAVAILABLE
+    assert cs.get_available("test_cpid", connector_id=1) is False
+
+
+@pytest.mark.asyncio
+async def test_single_connector_availability_status_missing(hass):
+    """Keep the switch off until either status source reports."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG_DATA.copy())
+    cs = CentralSystem(hass, entry)
+    _install_dummy_cp(cs, num_connectors=1)
+    switch_desc = next(desc for desc in SWITCHES if desc.key == "availability")
+    entity = ChargePointSwitch(cs, "test_cpid", switch_desc)
+
+    assert cs.get_availability_status("test_cpid") is None
+    assert entity.is_on is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", list(ChargePointStatus))
+async def test_single_connector_availability_status_fallback(hass, status):
+    """Fallback changes the status source without redefining switch semantics."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG_DATA.copy())
+    cs = CentralSystem(hass, entry)
+    cp = _install_dummy_cp(cs, num_connectors=1)
+    switch_desc = next(desc for desc in SWITCHES if desc.key == "availability")
+    entity = ChargePointSwitch(cs, "test_cpid", switch_desc)
+
+    cp._metrics[(1, cstat.status_connector)] = M(status.value, None)
+
+    assert cs.get_availability_status("test_cpid") == status.value
+    assert entity.is_on is (status is ChargePointStatus.available)
+
+
+@pytest.mark.asyncio
+async def test_station_status_takes_precedence_for_availability(hass):
+    """Never override a reported station status with connector 1."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG_DATA.copy())
+    cs = CentralSystem(hass, entry)
+    cp = _install_dummy_cp(cs, num_connectors=1)
+    switch_desc = next(desc for desc in SWITCHES if desc.key == "availability")
+    entity = ChargePointSwitch(cs, "test_cpid", switch_desc)
+
+    cp._metrics[(0, cstat.status)] = M("Unavailable", None)
+    cp._metrics[(1, cstat.status_connector)] = M("Available", None)
+    assert cs.get_availability_status("test_cpid") == "Unavailable"
+    assert entity.is_on is False
+
+    cp._metrics[(0, cstat.status)].value = "Available"
+    cp._metrics[(1, cstat.status_connector)].value = "Unavailable"
+    assert cs.get_availability_status("test_cpid") == "Available"
+    assert entity.is_on is True
+
+
+@pytest.mark.asyncio
+async def test_availability_status_does_not_fallback_for_multiple_connectors(hass):
+    """Keep station status unknown when either topology source says multi."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG_DATA.copy())
+    cs = CentralSystem(hass, entry)
+    cp = _install_dummy_cp(cs, num_connectors=2)
+    cp._metrics[(1, cstat.status_connector)] = M("Available", None)
+
+    assert cs.get_availability_status("test_cpid") is None
+
+    # Runtime discovery starts at one; the configured count must still prevent
+    # a transient fallback while a known multi-connector charger reconnects.
+    cp.num_connectors = 1
+    cp.settings = SimpleNamespace(num_connectors=2)
+    assert cs.get_availability_status("test_cpid") is None
+    assert cs.get_availability_status("missing") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("switch_key", "connector_status"),
+    [
+        ("charge_control", ChargePointStatus.charging.value),
+        ("connnector_availability", ChargePointStatus.preparing.value),
+    ],
+)
+async def test_other_switches_keep_using_their_metric_path(
+    hass, monkeypatch, switch_key, connector_status
+):
+    """The availability resolver must not intercept other switch types."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG_DATA.copy())
+    cs = CentralSystem(hass, entry)
+    cp = _install_dummy_cp(cs, num_connectors=1)
+    cp._metrics[(1, cstat.status_connector)] = M(connector_status, None)
+
+    def unexpected_availability_lookup(*args, **kwargs):
+        raise AssertionError("availability resolver used by another switch")
+
+    monkeypatch.setattr(cs, "get_availability_status", unexpected_availability_lookup)
+    switch_desc = next(desc for desc in SWITCHES if desc.key == switch_key)
+    entity = ChargePointSwitch(
+        cs, "test_cpid", switch_desc, connector_id=1, flatten_single=True
+    )
+
+    assert entity.is_on is True
 
 
 @pytest.mark.asyncio
@@ -275,7 +402,7 @@ async def test_setters_when_missing_and_present(hass):
     # present -> routes and returns True
     cp = _install_dummy_cp(cs)
     assert await cs.set_max_charge_rate_amps("test_cpid", 16.0, connector_id=2) is True
-    assert ("set_charge_rate", {"limit_amps": 16.0, "conn_id": 2}) in cp.calls
+    assert cp.calls == [("set_station_charge_rate", {"limit_amps": 16.0})]
 
     # set_charger_state branches
     await cs.set_charger_state(
@@ -381,6 +508,307 @@ async def test_check_charger_available_decorator_and_services(hass):
         SimpleNamespace(data={"devid": "ok", "ocpp_key": "Foo"}),
     )
     assert resp == {"value": "value-for:Foo"}
+
+
+@pytest.mark.asyncio
+async def test_custom_profile_mapping_bypasses_string_parsing(hass):
+    """A structured profile reaches the charge point as the same mapping."""
+    cs, cp = _available_central_system(hass)
+    profile = {"id": 1, "transactionId": "session'42"}
+
+    await cs.handle_set_charge_rate(
+        SimpleNamespace(data={"devid": "ok", "conn_id": 2, "custom_profile": profile})
+    )
+
+    assert cp.calls == [("set_charge_rate", {"profile": profile, "conn_id": 2})]
+    assert cp.calls[0][1]["profile"] is profile
+
+
+@pytest.mark.asyncio
+async def test_custom_profile_literal_yaml_string_is_parsed(hass):
+    """Annotated YAML strings must not be sent raw to the OCPP layer."""
+    cs, cp = _available_central_system(hass)
+    profile = NodeStrClass('{"id":1,"transactionId":"session\'42"}')
+    data = CHRGR_SERVICE_DATA_SCHEMA(
+        {"devid": "ok", "conn_id": 1, "custom_profile": profile}
+    )
+
+    assert data["custom_profile"] is profile
+    await cs.handle_set_charge_rate(SimpleNamespace(data=data))
+
+    assert cp.calls == [
+        (
+            "set_charge_rate",
+            {
+                "profile": {"id": 1, "transactionId": "session'42"},
+                "conn_id": 1,
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_valid_json_custom_profile_preserves_apostrophe(hass):
+    """A legal apostrophe in a JSON string must not prevent dispatch."""
+    cs, cp = _available_central_system(hass)
+
+    await cs.handle_set_charge_rate(
+        SimpleNamespace(
+            data={
+                "devid": "ok",
+                "custom_profile": '{"id":1,"transactionId":"session\'42"}',
+            }
+        )
+    )
+
+    assert cp.calls == [
+        (
+            "set_charge_rate",
+            {
+                "profile": {"id": 1, "transactionId": "session'42"},
+                "conn_id": 0,
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_valid_json_custom_profile_cannot_redirect_fields(hass):
+    """Charger text inside valid JSON remains data rather than structure."""
+    cs, cp = _available_central_system(hass)
+    transaction_id = "x','id':2,'transactionId':'y"
+
+    await cs.handle_set_charge_rate(
+        SimpleNamespace(
+            data={
+                "devid": "ok",
+                "custom_profile": (
+                    "{\"id\":1,\"transactionId\":\"x','id':2,'transactionId':'y\"}"
+                ),
+            }
+        )
+    )
+
+    assert cp.calls == [
+        (
+            "set_charge_rate",
+            {
+                "profile": {"id": 1, "transactionId": transaction_id},
+                "conn_id": 0,
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_template_result_mapping_stays_structured(hass):
+    """The service schema must not turn a rendered mapping back into text."""
+    cs, cp = _available_central_system(hass)
+    transaction_id = "x','id':2,'transactionId':'y"
+    profile = {"id": 1, "transactionId": transaction_id}
+    wrapper = template_helper._parse_result(repr(profile))
+
+    assert isinstance(wrapper, dict)
+    data = CHRGR_SERVICE_DATA_SCHEMA(
+        {"devid": "ok", "conn_id": 2, "custom_profile": wrapper}
+    )
+    assert data["custom_profile"] is wrapper
+
+    await cs.handle_set_charge_rate(SimpleNamespace(data=data))
+
+    assert cp.calls == [("set_charge_rate", {"profile": profile, "conn_id": 2})]
+    assert cp.calls[0][1]["profile"] is wrapper
+
+
+@pytest.mark.asyncio
+async def test_legacy_custom_profile_logs_payload_free_debug(hass, caplog):
+    """Keep legacy parsing while making its use diagnosable without payloads."""
+    cs, cp = _available_central_system(hass)
+    transaction_id = "legacy-session"
+    custom_profile = f"{{'id':2,'transactionId':'{transaction_id}'}}"
+
+    with caplog.at_level(logging.DEBUG, logger="custom_components.ocpp"):
+        await cs.handle_set_charge_rate(
+            SimpleNamespace(data={"devid": "ok", "custom_profile": custom_profile})
+        )
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "legacy single-quote compatibility" in record.getMessage()
+    ]
+    assert cp.calls == [
+        (
+            "set_charge_rate",
+            {
+                "profile": {"id": 2, "transactionId": transaction_id},
+                "conn_id": 0,
+            },
+        )
+    ]
+    assert len(messages) == 1
+    assert "CP_OK" in messages[0]
+    assert custom_profile not in messages[0]
+    assert transaction_id not in messages[0]
+
+
+@pytest.mark.asyncio
+async def test_invalid_custom_profile_reports_original_json_position(hass):
+    """Syntax errors describe the caller's JSON and never dispatch a limit."""
+    cs, cp = _available_central_system(hass)
+
+    with pytest.raises(HomeAssistantError) as exc_info:
+        await cs.handle_set_charge_rate(
+            SimpleNamespace(
+                data={
+                    "devid": "ok",
+                    "custom_profile": "{'id':",
+                    "limit_amps": 16,
+                }
+            )
+        )
+
+    assert exc_info.value.translation_key == "invalid_custom_profile"
+    message = exc_info.value.translation_placeholders["message"]
+    assert "Expecting property name enclosed in double quotes" in message
+    assert "line 1, column 2" in message
+    assert "legacy single-quote compatibility parsing also failed" in message
+    assert cp.calls == []
+
+
+@pytest.mark.asyncio
+async def test_invalid_json_without_apostrophe_skips_legacy_fallback(hass):
+    """Plain malformed JSON reports its location without claiming a fallback."""
+    cs, cp = _available_central_system(hass)
+
+    with pytest.raises(HomeAssistantError) as exc_info:
+        await cs.handle_set_charge_rate(
+            SimpleNamespace(data={"devid": "ok", "custom_profile": '{"id":'})
+        )
+
+    message = exc_info.value.translation_placeholders["message"]
+    assert exc_info.value.translation_key == "invalid_custom_profile"
+    assert "Expecting value" in message
+    assert "line 1, column 7" in message
+    assert "legacy" not in message
+    assert cp.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [ValueError, RecursionError])
+async def test_json_parser_limit_error_is_translated(hass, monkeypatch, error_type):
+    """Non-syntax decoder limits must not escape as unexpected errors."""
+    cs, cp = _available_central_system(hass)
+
+    def exceed_parser_limit(_custom_profile):
+        raise error_type("parser detail must not reach the caller")
+
+    monkeypatch.setattr("custom_components.ocpp.api.json.loads", exceed_parser_limit)
+
+    with pytest.raises(HomeAssistantError) as exc_info:
+        await cs.handle_set_charge_rate(
+            SimpleNamespace(data={"devid": "ok", "custom_profile": '{"id":1}'})
+        )
+
+    assert exc_info.value.translation_key == "invalid_custom_profile"
+    assert exc_info.value.translation_placeholders["message"] == (
+        "JSON could not be decoded within parser limits"
+    )
+    assert cp.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [ValueError, RecursionError])
+async def test_legacy_json_parser_limit_error_is_translated(
+    hass, monkeypatch, error_type
+):
+    """A parser limit in the legacy candidate retains the original location."""
+    cs, cp = _available_central_system(hass)
+    parse_attempts = 0
+
+    def exceed_legacy_parser_limit(custom_profile):
+        nonlocal parse_attempts
+        parse_attempts += 1
+        if parse_attempts == 1:
+            raise json.JSONDecodeError(
+                "Expecting property name enclosed in double quotes",
+                custom_profile,
+                1,
+            )
+        raise error_type("parser detail must not reach the caller")
+
+    monkeypatch.setattr(
+        "custom_components.ocpp.api.json.loads", exceed_legacy_parser_limit
+    )
+
+    with pytest.raises(HomeAssistantError) as exc_info:
+        await cs.handle_set_charge_rate(
+            SimpleNamespace(data={"devid": "ok", "custom_profile": "{'id':1}"})
+        )
+
+    message = exc_info.value.translation_placeholders["message"]
+    assert exc_info.value.translation_key == "invalid_custom_profile"
+    assert "Expecting property name enclosed in double quotes" in message
+    assert "line 1, column 2" in message
+    assert "compatibility parsing exceeded JSON parser limits" in message
+    assert "parser detail" not in message
+    assert parse_attempts == 2
+    assert cp.calls == []
+
+
+@pytest.mark.asyncio
+async def test_unexpected_custom_profile_type_is_rejected(hass):
+    """Keep direct handler calls from forwarding an unsupported value type."""
+    cs, cp = _available_central_system(hass)
+
+    with pytest.raises(HomeAssistantError) as exc_info:
+        await cs.handle_set_charge_rate(
+            SimpleNamespace(data={"devid": "ok", "custom_profile": ["profile"]})
+        )
+
+    assert exc_info.value.translation_key == "invalid_custom_profile"
+    assert exc_info.value.translation_placeholders["message"] == (
+        "expected a mapping or JSON object, got list"
+    )
+    assert cp.calls == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_non_object_is_rejected_without_success_log(hass, caplog):
+    """A syntactically compatible scalar is not a successful legacy profile."""
+    cs, cp = _available_central_system(hass)
+
+    with (
+        caplog.at_level(logging.DEBUG, logger="custom_components.ocpp"),
+        pytest.raises(HomeAssistantError),
+    ):
+        await cs.handle_set_charge_rate(
+            SimpleNamespace(data={"devid": "ok", "custom_profile": "['profile']"})
+        )
+
+    assert not any(
+        "legacy single-quote compatibility" in record.getMessage()
+        for record in caplog.records
+    )
+    assert cp.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("custom_profile", ["null", "[]", "42", "true", '"text"'])
+async def test_non_object_custom_profile_is_rejected(hass, custom_profile):
+    """Only JSON objects can cross the custom-profile service boundary."""
+    cs, cp = _available_central_system(hass)
+
+    with pytest.raises(HomeAssistantError) as exc_info:
+        await cs.handle_set_charge_rate(
+            SimpleNamespace(data={"devid": "ok", "custom_profile": custom_profile})
+        )
+
+    assert exc_info.value.translation_key == "invalid_custom_profile"
+    assert "expected a JSON object" in str(
+        exc_info.value.translation_placeholders["message"]
+    )
+    assert cp.calls == []
 
 
 def test_del_metric_variants(hass):
@@ -623,9 +1051,9 @@ async def test_on_connect_cancels_tasks_when_stop_fails(hass, monkeypatch):
     # must not raise, and must still replace the charge point
     await cs.on_connect(_make_ws("ocpp2.0.1"))
 
-    assert all(
-        task.cancelled for task in old_cp.tasks
-    ), "stale charge point's tasks must be cancelled when stop() fails"
+    assert all(task.cancelled for task in old_cp.tasks), (
+        "stale charge point's tasks must be cancelled when stop() fails"
+    )
     assert cs.charge_points["CP_1"] is new_cp
     assert new_cp.started is True
 
@@ -652,3 +1080,421 @@ async def test_on_connect_reconnects_when_version_unchanged(hass, monkeypatch):
     assert cs.charge_points["CP_1"] is cp
     assert cp.reconnected_with is ws
     assert cp.stopped is False
+
+
+# ---------------------------------------------------------------------------
+# Regression tests: service routing across multiple central systems
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_supplied_but_unresolved_devid_raises(hass):
+    """A devid that was supplied and matches nothing must not pick a charger.
+
+    The caller named a target, so running the action against a different one
+    is worse than failing. Only an omitted devid falls back - see
+    test_single_cp_fallback_for_missing_devid.
+    """
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG_DATA.copy())
+    cs = CentralSystem(hass, entry)
+
+    first = _install_dummy_cp(cs, cpid="cp_a", cp_id="CP_A", status=STATE_OK)
+    second = _install_dummy_cp(cs, cpid="cp_b", cp_id="CP_B", status=STATE_OK)
+
+    with pytest.raises(HomeAssistantError):
+        await cs.handle_clear_profile(
+            SimpleNamespace(data={"devid": "completely_unknown_charger"}),
+        )
+
+    # Neither charger may be touched by a call that could not be resolved.
+    assert not first.calls
+    assert not second.calls
+
+
+@pytest.mark.asyncio
+async def test_supplied_but_unresolved_devid_raises_with_a_single_charger(hass):
+    """The strict rule holds even when there is only one charger to pick."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG_DATA.copy())
+    cs = CentralSystem(hass, entry)
+
+    only = _install_dummy_cp(cs, cpid="only_cpid", cp_id="CP_ONLY", status=STATE_OK)
+
+    with pytest.raises(HomeAssistantError):
+        await cs.handle_clear_profile(SimpleNamespace(data={"devid": "not_this_one"}))
+
+    assert not only.calls
+
+
+@pytest.mark.asyncio
+async def test_service_call_raises_when_no_charge_points(hass):
+    """With no charger to fall back to the call must fail explicitly."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG_DATA.copy())
+    cs = CentralSystem(hass, entry)
+
+    with pytest.raises(HomeAssistantError):
+        await cs.handle_clear_profile(SimpleNamespace(data={"devid": "anything"}))
+
+
+@pytest.mark.asyncio
+async def test_single_cp_fallback_for_missing_devid(hass):
+    """Backwards compatibility: a single CP falls back when devid is missing.
+
+    Legacy service calls did not always include a devid.  With exactly one
+    charge point on the central system the intended target is unambiguous,
+    so keep the historical fallback behaviour.
+    """
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG_DATA.copy())
+    cs = CentralSystem(hass, entry)
+
+    cp = _install_dummy_cp(cs, cpid="only_cpid", cp_id="CP_ONLY", status=STATE_OK)
+
+    # Key absent entirely, and present but blank: both mean "no target given".
+    await cs.handle_clear_profile(SimpleNamespace(data={}))
+    await cs.handle_clear_profile(SimpleNamespace(data={"devid": ""}))
+    assert [k for k, _ in cp.calls] == ["clear_profile", "clear_profile"]
+
+
+@pytest.mark.asyncio
+async def test_devid_resolves_by_cpid(hass):
+    """Service call with devid equal to the HA cpid routes to the correct charger."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG_DATA.copy())
+    cs = CentralSystem(hass, entry)
+
+    cp = _install_dummy_cp(cs, cpid="garage_charger", cp_id="CP_001", status=STATE_OK)
+
+    await cs.handle_clear_profile(SimpleNamespace(data={"devid": "garage_charger"}))
+    assert any(k == "clear_profile" for k, _ in cp.calls)
+
+
+@pytest.mark.asyncio
+async def test_devid_resolves_by_cp_id(hass):
+    """Service call with devid equal to the raw OCPP cp_id routes to the correct charger."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG_DATA.copy())
+    cs = CentralSystem(hass, entry)
+
+    cp = _install_dummy_cp(cs, cpid="garage_charger", cp_id="CP_001", status=STATE_OK)
+
+    await cs.handle_clear_profile(SimpleNamespace(data={"devid": "CP_001"}))
+    assert any(k == "clear_profile" for k, _ in cp.calls)
+
+
+@pytest.mark.asyncio
+async def test_multi_central_system_routing_via_global_resolver(hass):
+    """Two CentralSystem instances must not interfere.
+
+    _resolve_central_system must route a devid to exactly the CS that owns
+    the charger.
+    """
+    from custom_components.ocpp import _resolve_central_system
+
+    entry_a = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG_DATA.copy())
+    entry_b = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG_DATA.copy())
+    cs_a = CentralSystem(hass, entry_a)
+    cs_b = CentralSystem(hass, entry_b)
+
+    _install_dummy_cp(cs_a, cpid="charger_a", cp_id="CP_A", status=STATE_OK)
+    _install_dummy_cp(cs_b, cpid="charger_b", cp_id="CP_B", status=STATE_OK)
+
+    # Register both in hass.data so the resolver can find them.
+    hass.data.setdefault(DOMAIN, {})
+    hass.data[DOMAIN][entry_a.entry_id] = cs_a
+    hass.data[DOMAIN][entry_b.entry_id] = cs_b
+
+    # devid "charger_a" (cpid) must resolve to cs_a
+    assert _resolve_central_system(hass, "charger_a") is cs_a
+    # devid "CP_B" (cp_id) must resolve to cs_b
+    assert _resolve_central_system(hass, "CP_B") is cs_b
+    # devid "charger_b" (cpid in cs_b) must resolve to cs_b
+    assert _resolve_central_system(hass, "charger_b") is cs_b
+    # unknown devid must raise
+    with pytest.raises(HomeAssistantError):
+        _resolve_central_system(hass, "nonexistent")
+    # empty devid is ambiguous with multiple CSes and must raise
+    with pytest.raises(HomeAssistantError):
+        _resolve_central_system(hass, "")
+
+
+@pytest.mark.asyncio
+async def test_empty_devid_resolves_to_only_central_system(hass):
+    """Backwards compatibility: empty devid resolves when only one CS is loaded."""
+    from custom_components.ocpp import _resolve_central_system
+
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG_DATA.copy())
+    cs = CentralSystem(hass, entry)
+
+    _install_dummy_cp(cs, cpid="only_cpid", cp_id="CP_ONLY", status=STATE_OK)
+
+    hass.data.setdefault(DOMAIN, {})
+    hass.data[DOMAIN][entry.entry_id] = cs
+
+    assert _resolve_central_system(hass, "") is cs
+
+
+@pytest.mark.asyncio
+async def test_unload_preserves_services_while_second_cs_active(hass):
+    """Unloading one entry must not remove domain services while a second is still active."""
+    from custom_components.ocpp import _resolve_central_system, _DOMAIN_SERVICE_NAMES
+
+    hass.data.setdefault(DOMAIN, {})
+
+    entry_a = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG_DATA.copy())
+    entry_b = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG_DATA.copy())
+    cs_a = CentralSystem(hass, entry_a)
+    cs_b = CentralSystem(hass, entry_b)
+
+    _install_dummy_cp(cs_a, cpid="charger_a", cp_id="CP_A", status=STATE_OK)
+    _install_dummy_cp(cs_b, cpid="charger_b", cp_id="CP_B", status=STATE_OK)
+
+    hass.data[DOMAIN][entry_a.entry_id] = cs_a
+    hass.data[DOMAIN][entry_b.entry_id] = cs_b
+    hass.data[DOMAIN][_DOMAIN_SERVICE_NAMES] = ["configure"]
+
+    # Simulate entry_a being removed (as async_unload_entry would do after
+    # successful platform unload).
+    hass.data[DOMAIN].pop(entry_a.entry_id)
+
+    # cs_b is still registered, so devid resolution must still work.
+    assert _resolve_central_system(hass, "charger_b") is cs_b
+    assert _resolve_central_system(hass, "CP_B") is cs_b
+
+
+@pytest.mark.asyncio
+async def test_duplicate_cp_id_across_central_systems_is_rejected(hass):
+    """The same OCPP cp_id in two systems must not resolve to an arbitrary one.
+
+    cp_id is reported by the charger, so two central systems can each own one
+    with the factory default name. Picking the first would be a coin flip on a
+    mutating service call, so the resolver refuses and the user is expected to
+    use their unique cpid instead.
+    """
+    from custom_components.ocpp import _resolve_central_system
+
+    entry_a = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG_DATA.copy())
+    entry_b = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG_DATA.copy())
+    cs_a = CentralSystem(hass, entry_a)
+    cs_b = CentralSystem(hass, entry_b)
+
+    # Same OCPP id on both sides, distinct HA cpids - what the config flow allows.
+    _install_dummy_cp(cs_a, cpid="garage", cp_id="CP_1", status=STATE_OK)
+    _install_dummy_cp(cs_b, cpid="driveway", cp_id="CP_1", status=STATE_OK)
+
+    hass.data.setdefault(DOMAIN, {})
+    hass.data[DOMAIN][entry_a.entry_id] = cs_a
+    hass.data[DOMAIN][entry_b.entry_id] = cs_b
+
+    with pytest.raises(HomeAssistantError):
+        _resolve_central_system(hass, "CP_1")
+
+    # The unique cpid still resolves each side unambiguously.
+    assert _resolve_central_system(hass, "garage") is cs_a
+    assert _resolve_central_system(hass, "driveway") is cs_b
+
+
+@pytest.mark.asyncio
+async def test_cpid_wins_over_a_colliding_cp_id(hass):
+    """A cpid must not be shadowed by another system's identical cp_id.
+
+    cpid is kept unique by the config flow, cp_id is not, so the unique
+    identifier has to be matched first regardless of load order.
+    """
+    from custom_components.ocpp import _resolve_central_system
+
+    entry_a = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG_DATA.copy())
+    entry_b = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG_DATA.copy())
+    cs_a = CentralSystem(hass, entry_a)
+    cs_b = CentralSystem(hass, entry_b)
+
+    # cs_a owns a charger whose raw cp_id happens to equal cs_b's cpid.
+    _install_dummy_cp(cs_a, cpid="charger_a", cp_id="shared_name", status=STATE_OK)
+    _install_dummy_cp(cs_b, cpid="shared_name", cp_id="CP_B", status=STATE_OK)
+
+    hass.data.setdefault(DOMAIN, {})
+    hass.data[DOMAIN][entry_a.entry_id] = cs_a
+    hass.data[DOMAIN][entry_b.entry_id] = cs_b
+
+    # cs_a is registered first, but the cpid owner must win.
+    assert _resolve_central_system(hass, "shared_name") is cs_b
+
+
+class _SessionMetric:
+    def __init__(self, value=None):
+        self.value = value
+
+
+def _session_cp(**overrides):
+    metrics = {
+        (1, cstat.status_connector): _SessionMetric("Charging"),
+        (1, csess.transaction_id): _SessionMetric(55),
+    }
+    cp = SimpleNamespace(
+        status=STATE_OK,
+        supported_features=prof.SMART,
+        settings=SimpleNamespace(max_current=32),
+        num_connectors=2,
+        _metrics=metrics,
+        transaction_is_unsafe=lambda _c: False,
+    )
+    for key, value in overrides.items():
+        setattr(cp, key, value)
+    return cp, metrics
+
+
+@pytest.mark.asyncio
+async def test_session_limit_availability_rule(hass):
+    """Charger up with SMART, connector charging, transaction shown, not held."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG_DATA)
+    entry.add_to_hass(hass)
+    cs = CentralSystem(hass, entry)
+    cp, metrics = _session_cp()
+    cs.charge_points["CP_1"] = cp
+    cs.cpids["cpid_1"] = "CP_1"
+
+    assert cs.session_limit_available("cpid_1", 1)
+    assert cs.session_transaction_id("cpid_1", 1) == "55"
+    assert cs.charger_generation("cpid_1") == 0
+    cp.charger_generation = 3
+    assert cs.charger_generation("cpid_1") == 3
+    assert cs.charger_generation("missing") == 0
+    assert not cs.session_limit_available("cpid_1", 2)  # nothing displayed
+    assert cs.session_transaction_id("cpid_1", 2) is None
+    assert not cs.session_limit_available("missing", 1)
+    assert cs.session_transaction_id("missing", 1) is None
+
+    for status in ("SuspendedEV", "SuspendedEVSE"):
+        metrics[(1, cstat.status_connector)].value = status
+        assert cs.session_limit_available("cpid_1", 1)
+    for status in ("Preparing", "Finishing", "Available", None):
+        metrics[(1, cstat.status_connector)].value = status
+        assert not cs.session_limit_available("cpid_1", 1)
+    metrics[(1, cstat.status_connector)].value = "Charging"
+
+    for tx in (None, "", 0):
+        metrics[(1, csess.transaction_id)].value = tx
+        assert not cs.session_limit_available("cpid_1", 1)
+    metrics[(1, csess.transaction_id)].value = "tx-201"
+    assert cs.session_transaction_id("cpid_1", 1) == "tx-201"
+    assert cs.session_limit_available("cpid_1", 1)
+
+    cp.transaction_is_unsafe = lambda _c: True
+    assert not cs.session_limit_available("cpid_1", 1)
+    cp.transaction_is_unsafe = lambda _c: False
+    cp.supported_features = 0
+    assert not cs.session_limit_available("cpid_1", 1)
+    cp.supported_features = prof.SMART
+    cp.status = STATE_UNAVAILABLE
+    assert not cs.session_limit_available("cpid_1", 1)
+
+
+@pytest.mark.asyncio
+async def test_set_session_charge_rate_amps_reaches_the_charge_point(hass):
+    """Every value, the configured maximum included, is set on the connector."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG_DATA)
+    entry.add_to_hass(hass)
+    cs = CentralSystem(hass, entry)
+    calls = []
+
+    async def set_limit(connector_id, amps):
+        calls.append((connector_id, amps))
+        return True
+
+    cp, _metrics = _session_cp(set_session_limit=set_limit)
+    cs.charge_points["CP_1"] = cp
+    cs.cpids["cpid_1"] = "CP_1"
+
+    assert await cs.set_session_charge_rate_amps("cpid_1", 1, 16) is True
+    assert await cs.set_session_charge_rate_amps("CP_1", 2, 32) is True
+    assert calls == [(1, 16.0), (2, 32.0)]
+    with pytest.raises(HomeAssistantError):
+        await cs.set_session_charge_rate_amps("missing", 1, 16)
+
+
+@pytest.mark.asyncio
+async def test_session_default_limit_availability_rule(hass):
+    """Charger up with SMART; no transaction or connector status needed."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG_DATA)
+    entry.add_to_hass(hass)
+    cs = CentralSystem(hass, entry)
+    targets = {1}
+    cp, metrics = _session_cp(
+        session_default_target_known=lambda connector: connector in targets
+    )
+    cs.charge_points["CP_1"] = cp
+    cs.cpids["cpid_1"] = "CP_1"
+
+    assert cs.session_default_limit_available("cpid_1", 1)
+    assert not cs.session_default_limit_available("cpid_1", 2)  # target unknown
+    metrics[(1, cstat.status_connector)].value = "Available"
+    metrics[(1, csess.transaction_id)].value = None
+    cp.transaction_is_unsafe = lambda _c: True
+    assert cs.session_default_limit_available("cpid_1", 1)
+    assert not cs.session_default_limit_available("missing", 1)
+
+    cp.supported_features = 0
+    assert not cs.session_default_limit_available("cpid_1", 1)
+    cp.supported_features = prof.SMART
+    cp.status = STATE_UNAVAILABLE
+    assert not cs.session_default_limit_available("cpid_1", 1)
+
+
+@pytest.mark.asyncio
+async def test_set_session_default_charge_rate_amps_reaches_the_charge_point(hass):
+    """The value goes to the connector's default limit, by cpid or cp_id."""
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG_DATA)
+    entry.add_to_hass(hass)
+    cs = CentralSystem(hass, entry)
+    calls = []
+
+    async def set_default(connector_id, amps):
+        calls.append((connector_id, amps))
+        return True
+
+    cp, _metrics = _session_cp(set_session_default_limit=set_default)
+    cs.charge_points["CP_1"] = cp
+    cs.cpids["cpid_1"] = "CP_1"
+
+    assert await cs.set_session_default_charge_rate_amps("cpid_1", 1, 16) is True
+    assert await cs.set_session_default_charge_rate_amps("CP_1", 2, 32) is True
+    assert calls == [(1, 16.0), (2, 32.0)]
+    with pytest.raises(HomeAssistantError):
+        await cs.set_session_default_charge_rate_amps("missing", 1, 16)
+
+
+@pytest.mark.asyncio
+async def test_settings_ignore_keys_from_a_later_release(hass, monkeypatch):
+    """A rollback must not fail a charger on a setting this release does not know."""
+    from unittest.mock import AsyncMock
+
+    from custom_components.ocpp.const import CONF_CPIDS
+
+    from tests.const import MOCK_CONFIG_CP_APPEND
+
+    stored = {**MOCK_CONFIG_CP_APPEND, "setting_from_the_future": True}
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            **MOCK_CONFIG_DATA,
+            "setting_from_the_future": True,
+            CONF_CPIDS: [{"CP_future": stored}],
+        },
+    )
+    entry.add_to_hass(hass)
+    cs = CentralSystem(hass, entry)
+    assert cs.settings.csid == MOCK_CONFIG_DATA["csid"]
+
+    cp = SimpleNamespace(start=AsyncMock())
+    built = []
+
+    def build(_cp_id, _websocket, settings):
+        built.append(settings)
+        return cp
+
+    monkeypatch.setattr(cs, "_build_charge_point", build)
+    websocket = SimpleNamespace(
+        subprotocol="ocpp1.6", request=SimpleNamespace(path="/CP_future")
+    )
+    await cs.on_connect(websocket)
+
+    assert [settings.cpid for settings in built] == [stored["cpid"]]
+    assert not hasattr(built[0], "setting_from_the_future")
+    assert cs.charge_points["CP_future"] is cp
+    cp.start.assert_awaited_once()

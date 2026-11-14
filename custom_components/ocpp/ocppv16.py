@@ -1,14 +1,20 @@
 """Representation of a OCPP 1.6 charging station."""
 
+import asyncio
 from datetime import datetime, timedelta, UTC
 import json
+import hashlib
 import logging
+import math
 
 import time
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.const import UnitOfTime
+from homeassistant.helpers.storage import Store
+from homeassistant.util import slugify
 import voluptuous as vol
 from websockets.asyncio.server import ServerConnection
 
@@ -27,8 +33,8 @@ from ocpp.v16.enums import (
     ClearChargingProfileStatus,
     ConfigurationStatus,
     DataTransferStatus,
-    Measurand,
     MessageTrigger,
+    ReadingContext,
     RegistrationStatus,
     RemoteStartStopStatus,
     ResetStatus,
@@ -58,11 +64,13 @@ from .const import (
     CentralSystemSettings,
     ChargerSystemSettings,
     DEFAULT_LIGHT_INTENSITY,
-    DEFAULT_MAX_CURRENT,
     DEFAULT_MEASURAND,
+    DEFAULT_MAX_CURRENT,
+    DOMAIN,
     HA_ENERGY_UNIT,
     MEASURANDS,
     SYNCEV_VENDOR_KEY_MODELS,
+    STATION_MAX_PROFILE_ABSOLUTE_START,
 )
 
 _LOGGER: logging.Logger = logging.getLogger(__package__)
@@ -81,6 +89,71 @@ def _to_message_trigger(name: str) -> MessageTrigger | None:
         "firmwarestatusnotification": MessageTrigger.firmware_status_notification,
     }
     return mapping.get(key)
+
+
+# Charge-rate defaults plus conservative electrical conversion fallbacks.
+_DEFAULT_LIMIT_AMPS = DEFAULT_MAX_CURRENT
+_DEFAULT_LIMIT_WATTS = 22000
+
+# Limit connectors to prevent OOM in case a corrupted charger reports an invalid number.
+_MAX_CONNECTORS = 10
+
+# Persisted transaction identity: the last id handed out (so ids stay unique
+# across restarts) and each running transaction's start time (so a session
+# adopted after a restart keeps its real duration). Best effort by design: a
+# handler never waits for the write, because charging must not depend on
+# Home Assistant's disk.
+_TX_STORE_VERSION = 1
+_TX_STORE_SAVE_DELAY = 1.0
+
+# Connector statuses that prove a transaction is running, and ones that prove
+# the connector has none. Anything else - Faulted, Preparing - says nothing
+# either way about a transaction the connector was holding.
+_TX_RUNNING_STATUSES = (
+    ChargePointStatus.charging.value,
+    ChargePointStatus.suspended_ev.value,
+    ChargePointStatus.suspended_evse.value,
+)
+_TX_ENDED_STATUSES = (
+    ChargePointStatus.available.value,
+    ChargePointStatus.finishing.value,
+    ChargePointStatus.unavailable.value,
+    ChargePointStatus.reserved.value,
+)
+# Ids adopted from a charger above this are outside the range the integration
+# allocates in, so there is nothing to stay clear of.
+_TX_ID_CEILING = 2**31 - 2
+
+
+def tx_store_key(entry_id: str, cp_id: str) -> str:
+    """Return the storage key for a charge point's transaction state.
+
+    slugify alone would collide: "CP-A", "CP_A" and "CP A" all become "cp_a",
+    and two chargers of one entry would then overwrite each other's state. A
+    digest of the raw id keeps the key readable and distinct.
+    """
+    digest = hashlib.sha256(cp_id.encode()).hexdigest()[:8]
+    return f"{DOMAIN}.v16_transactions.{entry_id}.{slugify(cp_id)}_{digest}"
+
+
+_AMPS_UNIT_TOKENS = frozenset({"current", "a", "amp", "amps", "ampere", "amperes"})
+_WATTS_UNIT_TOKENS = frozenset({"power", "w", "watt", "watts"})
+
+
+def _allowed_charging_rate_units(units_resp: str | None) -> tuple[bool, bool]:
+    """Parse ChargingScheduleAllowedChargingRateUnit into (amps, watts) support."""
+    if not units_resp:
+        return True, False
+    tokens = {
+        tok.strip().lower()
+        for tok in str(units_resp).replace(";", ",").split(",")
+        if tok.strip()
+    }
+    supports_amps = bool(tokens & _AMPS_UNIT_TOKENS)
+    supports_watts = bool(tokens & _WATTS_UNIT_TOKENS)
+    if not supports_amps and not supports_watts:
+        return True, False
+    return supports_amps, supports_watts
 
 
 class ChargePoint(cp):
@@ -107,69 +180,387 @@ class ChargePoint(cp):
             charger,
         )
         self._active_tx: dict[int, int] = {}  # connector_id -> transaction_id
-        # BG Sync fork: both of these keys are reported readonly:true, so they
-        # cannot change while the connection is up. Upstream re-reads them on
-        # every set_charge_rate; with a solar controller setting a limit every
-        # ~15s that is 8 pointless round-trips a minute, and was observed
-        # saturating the request queue until GetConfiguration itself timed out.
-        self._rate_unit_cache: str | None = None
-        self._stack_level_cache: int | None = None
-        # Last limit the charger accepted, keyed by (profile purpose, connector).
-        # Used to skip SetChargingProfile calls that would be exact no-ops.
-        self._applied_limits: dict[tuple[str, int], float] = {}
-
-    def _invalidate_charging_profile_cache(self) -> None:
-        """Drop cached profile state, forcing a full refresh on the next set.
-
-        Called whenever the charger's own view of its profiles may have been
-        reset: a boot notification, or a transaction starting or ending. The
-        stop_transaction case is not theoretical -- a TxProfile is bound to its
-        transaction id and is discarded with it, verified on SL320S647
-        2026-08-10 when Current.Offered jumped from 16 A to 32 A after a
-        stop/start cycle. Trusting a cached 'already applied' value across that
-        boundary would leave the next session running uncapped, so this failure
-        mode is unsafe-by-default and must not be optimised away.
-        """
-        self._applied_limits.clear()
-        self._rate_unit_cache = None
-        self._stack_level_cache = None
-
-    async def _get_stack_level(self) -> int:
-        """Return a stack level this charger will actually accept.
-
-        ChargeProfileMaxStackLevel is an EXCLUSIVE bound on at least some
-        chargers. Verified on SL320S647 2026-08-10, which reports 5:
-
-            purpose               stackLevel 5 -> NotSupported
-            purpose               stackLevel 4 -> Accepted
-            ChargePointMaxProfile stackLevel 0 -> Accepted
-            TxProfile             stackLevel 0 -> Accepted
-
-        Every purpose is rejected at the advertised maximum and accepted below
-        it. Upstream sends the reported value verbatim, so ChargePointMaxProfile
-        and TxProfile never applied at all on this hardware -- only
-        TxDefaultProfile worked, and only because upstream happens to send it at
-        max(1, level - 1).
-
-        Clamping to reported_max - 1 rather than hardcoding 0 keeps the priority
-        ordering between profile purposes usable on chargers that honour it.
-        """
-        if self._stack_level_cache is not None:
-            return self._stack_level_cache
-        try:
-            resp = await self.get_configuration(
-                ckey.charge_profile_max_stack_level.value
-            )
-            reported_max = int(resp)
-        except Exception:
-            reported_max = 1
-        self._stack_level_cache = max(0, reported_max - 1)
-        _LOGGER.debug(
-            "Charger reports ChargeProfileMaxStackLevel %s; using stack level %s",
-            reported_max,
-            self._stack_level_cache,
+        self._ended_tx: dict[int, int] = {}  # connector_id -> last stopped tx
+        # Transaction identity and timing (#2123). The id was int(time.time())
+        # and doubled as the session start epoch: two connectors starting in
+        # the same second collided, and a charger-supplied id adopted by the
+        # self-heal path made the session timer count from a bogus reference.
+        self._last_tx_id: int = 0
+        self._tx_started_at: dict[int, float] = {}  # connector_id -> epoch
+        # Connectors whose transaction state could not be resolved from a
+        # StopTransaction: timer frozen, settled by the next status report.
+        self._tx_indeterminate: set[int] = set()
+        # connector_id -> (tx_id, started_at) as persisted before a restart
+        self._persisted_tx: dict[int, tuple[int, float]] = {}
+        # Payloads of StopTransactions that could not be attributed yet, each
+        # with the held connectors it could belong to. One is applied only when
+        # a settled connector is its sole possible owner; otherwise the final
+        # figures are omitted rather than knowingly cross-applied.
+        self._pending_stops: list[dict] = []
+        # Not atomic on purpose: Home Assistant's atomic writes fsync, which it
+        # documents as able to block for seconds, and this state is best
+        # effort - the loader tolerates a torn file and the clock still bounds
+        # new ids. An fsync per session on an SD-card install is not worth it.
+        self._tx_store = Store(
+            hass, _TX_STORE_VERSION, tx_store_key(entry.entry_id, id)
         )
-        return self._stack_level_cache
+        self._tx_store_load = None
+        # Smart Charging configuration keys the managed limits need (both
+        # required by OCPP 1.6 section 9.4), read on first use (#2148) and
+        # kept for the lifetime of this object, like the feature profiles and
+        # connector count read in post_connect. None means not read yet.
+        self._rate_units: tuple[bool, bool] | None = None  # (amps, watts)
+        # An int, or the charger's answer when it is not a number.
+        self._max_stack_level: int | str | None = None
+        # The library sends one request at a time, but two first limits would
+        # both read; the second waits for the first one's answer instead.
+        self._smart_charging_lock = asyncio.Lock()
+
+    # ------------------------------------------------------------------
+    # Transaction identity, timing and containment (#2123)
+    # ------------------------------------------------------------------
+
+    async def start(self):
+        """Start the charge point once its persisted transaction state is in.
+
+        The message loop would otherwise race the load: a StartTransaction
+        could allocate an id below the persisted ceiling, and MeterValues
+        could settle on an estimated start for the very session whose real
+        start was persisted. Writes stay asynchronous; only the one-time load
+        is waited for, and a broken store resolves immediately.
+        """
+        await self._async_tx_store_ready()
+        await super().start()
+
+    async def _async_tx_store_ready(self) -> None:
+        """Wait for the one-time load; safe to call repeatedly."""
+        self._ensure_tx_store_loaded()
+        await self._tx_store_load
+
+    def _ensure_tx_store_loaded(self) -> None:
+        """Start loading persisted transaction state once, without blocking.
+
+        start() awaits the load before the first message; handlers call this
+        as a backstop for paths that bypass start(), where the reconciliation
+        in the loader repairs anything decided before it finished.
+        """
+        if self._tx_store_load is None:
+            self._tx_store_load = self.hass.async_create_task(
+                self._async_load_tx_store()
+            )
+
+    async def _async_load_tx_store(self) -> None:
+        """Adopt the persisted last id and start times, tolerating any failure."""
+        try:
+            data = await self._tx_store.async_load()
+        except Exception as ex:  # a broken store must never stop charging
+            _LOGGER.warning("%s: could not load transaction state: %s", self.id, ex)
+            data = None
+        if not isinstance(data, dict):
+            return
+        try:
+            persisted_last = int(data.get("last_tx_id", 0) or 0)
+        except (TypeError, ValueError):
+            persisted_last = 0
+        # Never hand out an id at or below one returned before the restart.
+        self._last_tx_id = max(self._last_tx_id, persisted_last)
+        connectors = data.get("connectors", {})
+        if not isinstance(connectors, dict):
+            return
+        for key, item in connectors.items():
+            try:
+                conn, tx, started = (
+                    int(key),
+                    int(item["tx_id"]),
+                    float(item["started_at"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            self._note_transaction_id(tx)
+            # NaN and infinities parse as floats but would make every later
+            # session-time calculation raise; treat them as no start at all,
+            # which leaves the session with an estimated start instead.
+            if not math.isfinite(started) or started <= 0:
+                continue
+            self._persisted_tx[conn] = (tx, started)
+            # A session adopted before this finished settled on an estimated
+            # start; if it is the persisted one, give it its real start.
+            metric = self._metrics[(conn, csess.session_time)]
+            if self._active_tx.get(conn) == tx and metric.extra_attr.get(
+                "start_time_estimated"
+            ):
+                self._set_session_start(conn, started, estimated=False)
+
+    def _note_transaction_id(self, transaction_id) -> None:
+        """Keep allocations clear of an id that is live on some connector.
+
+        A transaction restored from Home Assistant state or adopted from
+        MeterValues is live but was not allocated here; without this, a
+        StartTransaction in the same second could hand out its id again.
+        """
+        try:
+            tx = int(transaction_id or 0)
+        except (TypeError, ValueError):
+            return
+        if 0 < tx <= _TX_ID_CEILING:
+            self._last_tx_id = max(self._last_tx_id, tx)
+
+    def _tx_store_snapshot(self) -> dict:
+        """Serialise what a restart needs: the last id and running sessions."""
+        return {
+            "last_tx_id": int(self._last_tx_id),
+            "connectors": {
+                str(conn): {
+                    "tx_id": int(tx),
+                    "started_at": float(self._tx_started_at[conn]),
+                }
+                for conn, tx in self._active_tx.items()
+                if tx and conn in self._tx_started_at
+            },
+        }
+
+    def _schedule_tx_store_save(self) -> None:
+        """Persist best-effort: coalesced, and never awaited by a handler."""
+        try:
+            self._tx_store.async_delay_save(
+                self._tx_store_snapshot, _TX_STORE_SAVE_DELAY
+            )
+        except Exception as ex:
+            _LOGGER.debug("%s: transaction state not persisted: %s", self.id, ex)
+
+    def _allocate_transaction_id(self) -> int:
+        """Return an id unique for this charge point, even within one second."""
+        tx_id = max(int(time.time()), self._last_tx_id + 1)
+        self._last_tx_id = tx_id
+        return tx_id
+
+    def _set_session_start(
+        self, connector_id: int, started_at: float, *, estimated: bool
+    ) -> None:
+        """Record when the connector's transaction began, flagging a guess."""
+        self._tx_started_at[connector_id] = started_at
+        metric = self._metrics[(connector_id, csess.session_time)]
+        metric.extra_attr = {"start_time_estimated": True} if estimated else {}
+
+    def _ensure_session_start(self, connector_id: int, transaction_id: int) -> float:
+        """Return the transaction's start time, adopting one if none is known.
+
+        A transaction learned from MeterValues rather than StartTransaction has
+        no recorded start. If it is the one persisted before a restart, its
+        real start is used; otherwise the first observation is, and the
+        session-time sensor says so with `start_time_estimated`.
+        """
+        started = self._tx_started_at.get(connector_id)
+        if started is not None:
+            return started
+        persisted = self._persisted_tx.get(connector_id)
+        if persisted is not None and persisted[0] == int(transaction_id or 0):
+            self._set_session_start(connector_id, persisted[1], estimated=False)
+        else:
+            self._set_session_start(connector_id, time.time(), estimated=True)
+        return self._tx_started_at[connector_id]
+
+    def _metric_transaction(self, connector_id: int) -> int:
+        """Return the transaction id the connector's metric holds, or 0."""
+        try:
+            return int(self._metrics[(connector_id, csess.transaction_id)].value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _live_connectors(self) -> list[int]:
+        """Return the connectors that have a transaction recorded anywhere."""
+        live = {c for c, tx in self._active_tx.items() if tx}
+        for conn in range(1, int(self.num_connectors or 1) + 1):
+            if self._metric_transaction(conn):
+                live.add(conn)
+        return sorted(live)
+
+    def _resolve_stop_connector(self, transaction_id: int) -> int | None:
+        """Find the connector a StopTransaction belongs to, or None if unsure.
+
+        Never guesses: applying a stop to the wrong connector ends a session
+        that is still running and files the other one's energy against it.
+        None means the caller must contain the uncertainty instead.
+        """
+        tx = int(transaction_id or 0)
+        by_map = [c for c, t in self._active_tx.items() if t and int(t) == tx]
+        if len(by_map) == 1:
+            return by_map[0]
+        if by_map:
+            return None  # duplicate ids on several connectors: cannot tell
+        by_metric = [
+            c
+            for c in range(1, int(self.num_connectors or 1) + 1)
+            if self._metric_transaction(c) == tx
+        ]
+        if len(by_metric) == 1:
+            return by_metric[0]
+        if by_metric:
+            return None
+        live = self._live_connectors()
+        if len(live) == 1:
+            _LOGGER.info(
+                "%s: StopTransaction for unrecorded id=%s applied to connector %s, "
+                "the only one with a transaction",
+                self.id,
+                tx,
+                live[0],
+            )
+            return live[0]
+        return None
+
+    def _clear_transaction_state(
+        self, connector_id: int, transaction_id: int, stop_reason=None
+    ) -> None:
+        """Forget the connector's transaction: the per-connector part of a stop."""
+        self._report_transaction_end(connector_id, transaction_id)
+        self._ended_tx[connector_id] = int(transaction_id or 0)
+        self._active_tx[connector_id] = 0
+        self._tx_started_at.pop(connector_id, None)
+        self._tx_indeterminate.discard(connector_id)
+        self._metrics[(connector_id, cstat.id_tag)].value = ""
+        self._metrics[(connector_id, csess.transaction_id)].value = 0
+        self._metrics[(connector_id, cstat.stop_reason)].value = stop_reason
+
+    def _apply_stop_energy(self, connector_id: int, meter_stop) -> None:
+        """Set the session's energy from the meter reading at its stop."""
+        ms_key = (connector_id, csess.meter_start)
+        if self._metrics[ms_key].value is None or self._charger_reports_session_energy:
+            return
+        try:
+            session_kwh = int(meter_stop) / 1000.0 - float(self._metrics[ms_key].value)
+        except Exception:
+            session_kwh = 0.0
+        # A stop below the start value can't be told apart from a
+        # session-relative meter, a meter replacement, a reset or a rollover,
+        # so keep the session value already derived instead of publishing a
+        # negative or the raw register.
+        if session_kwh < 0:
+            return
+        self._metrics[(connector_id, csess.session_energy)].value = session_kwh
+
+    def _forget_stop_candidate(self, connector_id: int) -> None:
+        """Record that this connector can no longer own any pending stop.
+
+        Used when the connector proves its transaction is still running: the
+        stop was not its, so it is kept for the remaining candidates.
+        """
+        for pending in self._pending_stops:
+            pending["candidates"].discard(connector_id)
+        self._pending_stops = [p for p in self._pending_stops if p["candidates"]]
+
+    def _invalidate_pending_stops(self, connector_id: int, evidence: str) -> None:
+        """Drop every pending stop this connector could have owned.
+
+        Evidence that a candidate's transaction ended by another route - its
+        own StopTransaction, its closing values, a new transaction starting on
+        it - means an unattributed stop naming it may have been a malformed
+        duplicate for it, so no other candidate can be shown to own it.
+        """
+        remaining = [
+            p for p in self._pending_stops if connector_id not in p["candidates"]
+        ]
+        dropped = len(self._pending_stops) - len(remaining)
+        self._pending_stops = remaining
+        if dropped:
+            _LOGGER.warning(
+                "%s: connector %s %s; %s unattributed stop(s) that could have been "
+                "its can no longer be attributed and are discarded",
+                self.id,
+                connector_id,
+                evidence,
+                dropped,
+            )
+
+    def transaction_is_unsafe(self, connector_id: int | None) -> bool:
+        """Return whether a remote stop of this connector would be refused.
+
+        True while the connector is held, and also while it shares its id with
+        a held connector: the same rule stop_transaction applies, so an
+        entity gating on this never offers a stop that cannot be sent.
+        """
+        if connector_id is None:
+            return False
+        if connector_id in self._tx_indeterminate:
+            return True
+        tx = int(self._active_tx.get(connector_id, 0) or 0)
+        return bool(tx) and tx in self._unsafe_transaction_ids()
+
+    def _claim_pending_stop(self, connector_id: int) -> dict | None:
+        """Return the one unattributed stop this connector can own, if any.
+
+        A stop is applied only when the settled connector is a candidate for
+        exactly one pending stop and no other evidence has since shown how a
+        candidate's transaction ended. With two unattributed stops outstanding,
+        neither can be shown to belong to whichever connector reports idle
+        first, so both sessions keep their last periodic figures rather than
+        knowingly receiving another session's final reading and reason.
+        """
+        mine = [p for p in self._pending_stops if connector_id in p["candidates"]]
+        self._forget_stop_candidate(connector_id)
+        if len(mine) == 1:
+            self._pending_stops = [p for p in self._pending_stops if p is not mine[0]]
+            return mine[0]
+        if mine:
+            _LOGGER.warning(
+                "%s: %s unattributed stops could belong to connector %s; its final "
+                "energy and stop reason are not recorded",
+                self.id,
+                len(mine),
+                connector_id,
+            )
+        return None
+
+    def _unsafe_transaction_ids(self) -> set[int]:
+        """Return ids a held connector may still own; never stop these remotely."""
+        unsafe = set()
+        for conn in self._tx_indeterminate:
+            unsafe.add(int(self._active_tx.get(conn, 0) or 0))
+            unsafe.add(self._metric_transaction(conn))
+        unsafe.discard(0)
+        return unsafe
+
+    def _resolve_indeterminate(
+        self, connector_id: int, *, running: bool, claim: bool = True
+    ) -> None:
+        """Settle a connector whose transaction state was held as unresolved.
+
+        `claim` is True only for a status report saying the connector is idle
+        with nothing else known: then a pending stop may be attributed to it.
+        Any other evidence that its transaction ended (closing values) passes
+        claim=False, and the stops it could have owned are discarded instead.
+        """
+        if connector_id not in self._tx_indeterminate:
+            return
+        if running:
+            self._tx_indeterminate.discard(connector_id)
+            # It did not end, so no unattributed stop can be its.
+            self._forget_stop_candidate(connector_id)
+            _LOGGER.info(
+                "%s: connector %s is still in its transaction", self.id, connector_id
+            )
+        else:
+            _LOGGER.info(
+                "%s: connector %s reports no transaction; ending the one it held",
+                self.id,
+                connector_id,
+            )
+            if claim:
+                pending = self._claim_pending_stop(connector_id)
+            else:
+                pending = None
+                self._invalidate_pending_stops(
+                    connector_id, "sent its own closing meter values"
+                )
+            self._clear_transaction_state(
+                connector_id,
+                self._active_tx.get(connector_id, 0),
+                pending.get("reason") if pending else None,
+            )
+            if pending is not None:
+                self._apply_stop_energy(connector_id, pending.get("meter_stop"))
+            self._zero_flow_measurands(connector_id)
+        self._schedule_tx_store_save()
 
     async def get_number_of_connectors(self) -> int:
         """Return number of connectors on this charger."""
@@ -206,7 +597,7 @@ class ChargePoint(cp):
                     try:
                         n = int(str(v).strip())
                         if n > 0:
-                            return n
+                            return min(n, _MAX_CONNECTORS)
                     except (ValueError, TypeError):
                         pass
 
@@ -214,7 +605,7 @@ class ChargePoint(cp):
 
     async def get_heartbeat_interval(self):
         """Retrieve heartbeat interval from the charger and store it."""
-        await self.get_configuration(ckey.heartbeat_interval.value)
+        await self.get_configuration(ckey.heartbeat_interval)
 
     async def get_supported_measurands(self) -> str:
         """Get comma-separated list of measurands supported by the charger."""
@@ -250,7 +641,7 @@ class ChargePoint(cp):
 
         all_measurands = self.settings.monitored_variables or ""
         autodetect_measurands = bool(self.settings.monitored_variables_autoconfig)
-        key = ckey.meter_values_sampled_data.value
+        key = ckey.meter_values_sampled_data
 
         desired_csv = all_measurands.strip().strip(",")
         cfg_ok = {ConfigurationStatus.accepted, ConfigurationStatus.reboot_required}
@@ -345,11 +736,11 @@ class ChargePoint(cp):
     async def set_standard_configuration(self):
         """Send configuration values to the charger."""
         await self.configure(
-            ckey.meter_value_sample_interval.value,
+            ckey.meter_value_sample_interval,
             str(self.settings.meter_interval),
         )
         await self.configure(
-            ckey.clock_aligned_data_interval.value,
+            ckey.clock_aligned_data_interval,
             str(self.settings.idle_interval),
             # BG Sync fork: SL320S647 reports this key readonly:true (verified
             # 2026-08-10 -- it is absent from the capped GetConfiguration dump
@@ -377,16 +768,28 @@ class ChargePoint(cp):
     async def get_supported_features(self) -> prof:
         """Get features supported by the charger."""
         features = prof.NONE
-        req = call.GetConfiguration(key=[ckey.supported_feature_profiles.value])
-        resp = await self.call(req)
+        req = call.GetConfiguration(key=[ckey.supported_feature_profiles])
         try:
-            feature_list = (resp.configuration_key[0][om.value.value]).split(",")
-        except (IndexError, KeyError, TypeError):
-            feature_list = [""]
+            resp = await self.call(req)
+        except TimeoutError:
+            _LOGGER.warning(
+                "No response to GetConfiguration for SupportedFeatureProfiles, "
+                "defaulting to Core"
+            )
+            await self.notify_ha(
+                "No response to GetConfiguration for SupportedFeatureProfiles, "
+                "defaulting to Core"
+            )
+            feature_list = [om.feature_profile_core]
+        else:
+            try:
+                feature_list = (resp.configuration_key[0][om.value]).split(",")
+            except (IndexError, KeyError, TypeError):
+                feature_list = [""]
         if feature_list[0] == "":
             _LOGGER.warning("No feature profiles detected, defaulting to Core")
             await self.notify_ha("No feature profiles detected, defaulting to Core")
-            feature_list = [om.feature_profile_core.value]
+            feature_list = [om.feature_profile_core]
 
         if self.settings.force_smart_charging:
             _LOGGER.warning("Force Smart Charging feature profile")
@@ -394,17 +797,17 @@ class ChargePoint(cp):
 
         for item in feature_list:
             item = item.strip().replace(" ", "")
-            if item == om.feature_profile_core.value:
+            if item == om.feature_profile_core:
                 features |= prof.CORE
-            elif item == om.feature_profile_firmware.value:
+            elif item == om.feature_profile_firmware:
                 features |= prof.FW
-            elif item == om.feature_profile_smart.value:
+            elif item == om.feature_profile_smart:
                 features |= prof.SMART
-            elif item == om.feature_profile_reservation.value:
+            elif item == om.feature_profile_reservation:
                 features |= prof.RES
-            elif item == om.feature_profile_remote.value:
+            elif item == om.feature_profile_remote:
                 features |= prof.REM
-            elif item == om.feature_profile_auth.value:
+            elif item == om.feature_profile_auth:
                 features |= prof.AUTH
             else:
                 _LOGGER.warning("Unknown feature profile detected ignoring: %s", item)
@@ -428,7 +831,7 @@ class ChargePoint(cp):
     async def trigger_status_notification(self):
         """Trigger status notifications for all connectors."""
         try:
-            n = int(self._metrics[0][cdet.connectors.value].value or 1)
+            n = int(self._metrics[0][cdet.connectors].value or 1)
         except Exception:
             n = 1
 
@@ -452,7 +855,7 @@ class ChargePoint(cp):
                 if cid > 0:
                     _LOGGER.warning("Failed with response: %s", status)
                     # Reduce to the last known-good connector index.
-                    self._metrics[0][cdet.connectors.value].value = max(1, cid - 1)
+                    self._metrics[0][cdet.connectors].value = max(1, cid - 1)
                     return False
                 # If connector 0 is rejected, continue probing numbered connectors.
 
@@ -470,6 +873,7 @@ class ChargePoint(cp):
 
         req = call.TriggerMessage(requested_message=trig)
         resp = await self.call(req)
+        _LOGGER.debug("TriggerMessage %s to %s answered: %s", trig, self.id, resp)
         if resp.status != TriggerMessageStatus.accepted:
             _LOGGER.warning("Failed with response: %s", resp.status)
             return False
@@ -495,10 +899,274 @@ class ChargePoint(cp):
             _LOGGER.debug("ClearChargingProfile raised %s (ignored)", ex)
             return False
 
+    async def _read_config_key(self, key: str) -> str | None:
+        """Read a configuration key: its value, or None without one.
+
+        A failed read raises, naming the key.
+        """
+        try:
+            value = await self.get_configuration(key)
+        except Exception as ex:
+            raise HomeAssistantError(f"Could not read {key} ({ex!r})") from ex
+        return value if isinstance(value, str) and value else None
+
+    async def _smart_charging_config(self) -> tuple[tuple[bool, bool], int]:
+        """Return the accepted rate units and the reported maximum stack level.
+
+        Each is read once. A failed read, or an answer without a value, keeps
+        nothing, so the next limit reads again. There is no fallback stack
+        level: one below a profile the charger already holds would be
+        accepted without effect.
+        """
+        async with self._smart_charging_lock:
+            rate_units = self._rate_units
+            if rate_units is None:
+                units = await self._read_config_key(
+                    ckey.charging_schedule_allowed_charging_rate_unit
+                )
+                # No answer, "Unknown" or no known unit: Amps, as before.
+                rate_units = _allowed_charging_rate_units(units)
+                if units is not None:
+                    self._rate_units = rate_units
+            if self._max_stack_level is None:
+                level = await self._read_config_key(ckey.charge_profile_max_stack_level)
+                if level is None:
+                    raise HomeAssistantError(
+                        f"Charger returned no {ckey.charge_profile_max_stack_level}"
+                    )
+                if level == "Unknown":
+                    # get_configuration's answer for a key the charger lists
+                    # as unknown. Level 1 is what releases up to 0.12.x sent
+                    # such a charger, so profiles they left are replaced, and
+                    # stack_level_below_max still brings it down to 0.
+                    _LOGGER.warning(
+                        "Charger does not support %s; using stack level 1",
+                        ckey.charge_profile_max_stack_level,
+                    )
+                    self._max_stack_level = 1
+                else:
+                    try:
+                        self._max_stack_level = int(level)
+                    except ValueError:
+                        self._max_stack_level = level
+            max_stack_level = self._max_stack_level
+        if not isinstance(max_stack_level, int):
+            raise HomeAssistantError(
+                f"Charger reported {ckey.charge_profile_max_stack_level}"
+                f" {max_stack_level!r}; OCPP 1.6 requires a number for smart"
+                " charging"
+            )
+        return rate_units, max_stack_level
+
+    async def _resolve_charge_rate(
+        self,
+        limit_amps: int | float | None,
+        limit_watts: int | float | None,
+        conn_id: int,
+    ) -> tuple[str, float, int]:
+        """Resolve units, electrical conversion and stack level for managed limits."""
+        rate_units, stack_level = await self._smart_charging_config()
+        supports_amps, supports_watts = rate_units
+        # Watt-only chargers (Huawei FusionCharge reports "Power") must not
+        # fall back to the old limit_watts=22000 default when the HA number
+        # entity passes only limit_amps.
+        if supports_amps and not supports_watts:
+            use_amps = True
+        elif supports_watts and not supports_amps:
+            use_amps = False
+        else:
+            use_amps = limit_amps is not None or limit_watts is None
+
+        if use_amps:
+            if limit_amps is not None:
+                limit_value = float(limit_amps)
+            elif limit_watts is not None:
+                limit_value = self._watts_to_amps(float(limit_watts), conn_id)
+            else:
+                limit_value = float(_DEFAULT_LIMIT_AMPS)
+        elif limit_watts is not None:
+            limit_value = float(limit_watts)
+        elif limit_amps is not None:
+            limit_value = self._amps_to_watts(float(limit_amps), conn_id)
+            _LOGGER.debug(
+                "Converted %.1f A to %.0f W for Power-only charger",
+                float(limit_amps),
+                limit_value,
+            )
+        else:
+            limit_value = float(_DEFAULT_LIMIT_WATTS)
+
+        # BG Sync fork: OCPP enforces multipleOf 0.1 on the schedule limit and
+        # the ocpp library validates before it transmits. A raw float from a
+        # solar controller (11.653986956521738) raised FormatViolationError
+        # and never reached the charger (SL320S647, 2026-08-10).
+        limit_value = round(limit_value, 1)
+
+        units_value = (
+            ChargingRateUnitType.amps.value
+            if use_amps
+            else ChargingRateUnitType.watts.value
+        )
+
+        # The 1.6 spec reads as both a maximum value and a count; some
+        # chargers (Timxon A0, Morek MEV11, ABB Terra AC) take it as a count.
+        # BG Sync fork: Sync Energy chargers do the same (SL320S647 reports 5,
+        # rejects 5 and accepts 0-4 for every purpose), so they get the lower
+        # level without the option. The option still works for a Sync model
+        # that reports an unexpected vendor string.
+        if self.settings.stack_level_below_max or self.is_sync_charger:
+            stack_level -= 1
+        stack_level = max(0, stack_level)
+
+        return units_value, limit_value, stack_level
+
+    def _station_charge_rate_request(
+        self, units_value: str, limit_value: float, stack_level: int
+    ) -> call.SetChargingProfile:
+        """Build the shared station ceiling used by the slider and action."""
+        charging_schedule = {
+            om.charging_rate_unit: units_value,
+            om.charging_schedule_period: [{om.start_period: 0, om.limit: limit_value}],
+        }
+        if self.settings.charge_point_max_profile_absolute:
+            charging_profile_kind = ChargingProfileKindType.absolute.value
+            charging_schedule[om.start_schedule] = STATION_MAX_PROFILE_ABSOLUTE_START
+        else:
+            charging_profile_kind = ChargingProfileKindType.relative.value
+        return call.SetChargingProfile(
+            connector_id=0,
+            cs_charging_profiles={
+                om.charging_profile_id: 1000,
+                om.stack_level: stack_level,
+                om.charging_profile_kind: charging_profile_kind,
+                om.charging_profile_purpose: ChargingProfilePurposeType.charge_point_max_profile.value,
+                om.charging_schedule: charging_schedule,
+            },
+        )
+
+    async def prepare_session_limit(
+        self,
+        connector_id: int,
+        limit_amps: float,
+        *,
+        source_watts: float | None = None,
+    ) -> dict:
+        """Resolve unit and stack before a transaction-bound set is recorded."""
+        unit, value, stack_level = await self._resolve_charge_rate(
+            None if source_watts is not None else limit_amps,
+            source_watts,
+            connector_id,
+        )
+        voltage = self._line_voltage(connector_id)
+        phases = self._phase_count(connector_id)
+        converted = source_watts is not None or (
+            unit == ChargingRateUnitType.watts.value and limit_amps is not None
+        )
+        return {
+            "unit": unit,
+            "value": value,
+            "amps": (
+                round(float(source_watts) / (voltage * phases), 1)
+                if source_watts is not None
+                else float(limit_amps)
+            ),
+            "stack_level": int(stack_level),
+            "target": connector_id,
+            "conversion_voltage": voltage if converted else None,
+            "conversion_phases": phases if converted else None,
+        }
+
+    def build_session_limit_request(
+        self,
+        connector_id: int,
+        transaction_id: int | str,
+        profile_id: int,
+        prepared: dict,
+    ):
+        """Build a Relative TxProfile bound to the active 1.6 transaction."""
+        return call.SetChargingProfile(
+            connector_id=int(connector_id),
+            cs_charging_profiles={
+                om.charging_profile_id: int(profile_id),
+                om.stack_level: int(prepared["stack_level"]),
+                om.charging_profile_kind: ChargingProfileKindType.relative.value,
+                om.charging_profile_purpose: ChargingProfilePurposeType.tx_profile.value,
+                om.transaction_id: int(transaction_id),
+                om.charging_schedule: {
+                    om.charging_rate_unit: prepared["unit"],
+                    om.charging_schedule_period: [
+                        {om.start_period: 0, om.limit: prepared["value"]}
+                    ],
+                },
+            },
+        )
+
+    def build_session_default_request(
+        self,
+        connector_id: int,
+        profile_id: int,
+        prepared: dict,
+    ):
+        """Build a Relative TxDefaultProfile for one connector.
+
+        The id and the stack level are the ones the set_charge_rate action
+        uses for its TxDefaultProfile leg, so the two address one profile. It
+        is the shape 0.11.4 sent after a refused station ceiling, which
+        chargers in #2158 apply.
+        """
+        return call.SetChargingProfile(
+            connector_id=int(connector_id),
+            cs_charging_profiles={
+                om.charging_profile_id: int(profile_id),
+                om.stack_level: int(prepared["stack_level"]),
+                om.charging_profile_kind: ChargingProfileKindType.relative.value,
+                om.charging_profile_purpose: ChargingProfilePurposeType.tx_default_profile.value,
+                om.charging_schedule: {
+                    om.charging_rate_unit: prepared["unit"],
+                    om.charging_schedule_period: [
+                        {om.start_period: 0, om.limit: prepared["value"]}
+                    ],
+                },
+            },
+        )
+
+    async def set_station_charge_rate(self, limit_amps: int | float) -> bool:
+        """Set only a station ceiling; transaction defaults cannot replace one."""
+        try:
+            if not (int(self.supported_features or 0) & prof.SMART):
+                raise HomeAssistantError(
+                    "Smart charging is not supported by this charger"
+                )
+            units, limit, stack_level = await self._resolve_charge_rate(
+                limit_amps, None, 0
+            )
+            req = self._station_charge_rate_request(units, limit, stack_level)
+            # _get_specific_response already raises CALLERRORs. Be explicit
+            # here so preserving the charger's reason does not rely on it.
+            resp = await self.call(req, suppress=False)
+            status = resp.status
+        except Exception as ex:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="set_variables_error",
+                translation_placeholders={"message": str(ex)},
+            ) from ex
+        if status != ChargingProfileStatus.accepted:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="set_variables_error",
+                translation_placeholders={
+                    "message": f"ChargePointMaxProfile: {status}"
+                    f"{self._stack_level_hint(stack_level, status)}"
+                },
+            )
+        self._note_accepted_stack_level(stack_level)
+        return True
+
     async def set_charge_rate(
         self,
-        limit_amps: int = 32,
-        limit_watts: int = 22000,
+        limit_amps: int | float | None = None,
+        limit_watts: int | float | None = None,
         conn_id: int = 0,
         profile: dict | None = None,
     ) -> bool:
@@ -523,43 +1191,15 @@ class ChargePoint(cp):
             _LOGGER.info("Smart charging is not supported by this charger")
             return False
 
-        # Determine allowed unit (default to Amps if not reported).
-        # Cached for the lifetime of the connection: the charger reports this
-        # key readonly:true, so it cannot change underneath us.
-        units_resp = self._rate_unit_cache
-        if units_resp is None:
-            units_resp = await self.get_configuration(
-                ckey.charging_schedule_allowed_charging_rate_unit.value
-            )
-            if not units_resp:
-                _LOGGER.debug("Charging rate unit not reported; assuming Amps")
-                units_resp = om.current.value
-            self._rate_unit_cache = units_resp
-            _LOGGER.debug("Cached charging rate unit: %s", units_resp)
-
-        use_amps = om.current.value in units_resp
-        # Round to one decimal place. The OCPP schema enforces multipleOf 0.1 on
-        # chargingSchedulePeriod[].limit, and the ocpp library validates locally
-        # before transmitting -- so a raw float from a solar controller (e.g.
-        # 11.653986956521738) raises FormatViolationError and never reaches the
-        # charger at all. Verified on SL320S647 2026-08-10, where it also
-        # surfaced as an HTTP 500 because upstream now raises on refusal.
-        limit_value = round(float(limit_amps if use_amps else limit_watts), 1)
-        units_value = (
-            ChargingRateUnitType.amps.value
-            if use_amps
-            else ChargingRateUnitType.watts.value
+        units_value, limit_value, stack_level = await self._resolve_charge_rate(
+            limit_amps, limit_watts, conn_id
         )
-
-        stack_level = await self._get_stack_level()
 
         # Helper to build a simple relative schedule with one period
         def _mk_schedule(_units: str, _limit: float) -> dict:
             return {
-                om.charging_rate_unit.value: _units,
-                om.charging_schedule_period.value: [
-                    {om.start_period.value: 0, om.limit.value: _limit}
-                ],
+                om.charging_rate_unit: _units,
+                om.charging_schedule_period: [{om.start_period: 0, om.limit: _limit}],
             }
 
         # Helper to generate a unique, stable chargingProfileId per purpose+connector
@@ -575,132 +1215,96 @@ class ChargePoint(cp):
                 n = 0
             return base + max(0, n)
 
+        # Try ChargePointMaxProfile (connectorId = 0)
+        try:
+            req = self._station_charge_rate_request(
+                units_value, limit_value, stack_level
+            )
+            resp = await self.call(req)
+            if resp.status == ChargingProfileStatus.accepted:
+                self._note_accepted_stack_level(stack_level)
+                return True
+            _LOGGER.debug(
+                "ChargePointMaxProfile not accepted (%s)%s; will continue.",
+                resp.status,
+                self._stack_level_hint(stack_level, resp.status),
+            )
+        except Exception as ex:
+            _LOGGER.debug("ChargePointMaxProfile call raised: %s", ex)
+
         # Target connector (default 1 if unspecified/0)
         target_cid = int(conn_id) if conn_id and int(conn_id) > 0 else 1
 
-        # Read active transaction on this connector
+        # Read active transaction on this connector. A held connector's id may
+        # belong to a transaction that has already ended, so no profile is
+        # bound to it until the charger settles the connector.
         try:
             active_tx_id = int(self._active_tx.get(target_cid, 0) or 0)
         except Exception:
             active_tx_id = 0
+        if target_cid in self._tx_indeterminate:
+            active_tx_id = 0
 
-        async def _apply_profile(
-            purpose: str,
-            cid: int,
-            tx_id: int | None = None,
-            value: float | None = None,
-        ) -> bool:
-            """Send one SetChargingProfile, skipping known no-ops.
-
-            ``value`` defaults to the requested limit; ChargePointMaxProfile
-            passes the station ceiling instead. Returns True when the charger
-            is known to hold ``value`` for this (purpose, connector) pair.
-            """
-            if value is None:
-                value = limit_value
-            cache_key = (purpose, cid)
-            if self._applied_limits.get(cache_key) == value:
-                _LOGGER.debug(
-                    "%s on connector %s already at %s; skipping", purpose, cid, value
-                )
-                return True
-
-            profile = {
-                om.charging_profile_id.value: _profile_id(purpose, cid),
-                om.stack_level.value: stack_level,
-                om.charging_profile_kind.value: ChargingProfileKindType.relative.value,
-                om.charging_profile_purpose.value: purpose,
-                om.charging_schedule.value: _mk_schedule(units_value, value),
-            }
-            if tx_id:
-                # Bind to the ongoing transaction
-                profile[om.transaction_id.value] = tx_id
-
-            try:
-                resp = await self.call(
-                    call.SetChargingProfile(
-                        connector_id=cid, cs_charging_profiles=profile
-                    )
-                )
-            except Exception as ex:
-                _LOGGER.debug("%s call raised: %s", purpose, ex)
-                self._applied_limits.pop(cache_key, None)
-                return False
-
-            if resp.status == ChargingProfileStatus.accepted:
-                self._applied_limits[cache_key] = value
-                return True
-
-            _LOGGER.debug("%s not accepted (%s).", purpose, resp.status)
-            self._applied_limits.pop(cache_key, None)
-            return False
-
-        # ChargePointMaxProfile is a station-wide SAFETY CEILING, not a control
-        # channel. Upstream rewrites it to the live target on every call, which
-        # is what makes stale-cap failures possible: the composite schedule
-        # takes the MINIMUM across purposes, so any moment where the ceiling
-        # holds an older, lower value silently caps the session.
-        #
-        # Verified on SL320S647 2026-08-10 with TxProfile held at 16 A:
-        #     ceiling 6 A  -> Current.Offered 6 A  (drawing 6.09 A)
-        #     ceiling 32 A -> Current.Offered 16 A (drawing 15.63 A)
-        # The cap is real and fully reversible.
-        #
-        # So pin the ceiling to the configured hardware maximum and let the
-        # Tx-purpose profiles modulate. With the no-op guard above this becomes
-        # a single write per connection instead of one per current change.
-        if use_amps:
-            cpmp_value = max(
-                float(self.settings.max_current or DEFAULT_MAX_CURRENT), limit_value
-            )
-        else:
-            # Watts-based chargers: no hardware ceiling is configured in Watts,
-            # so keep the previous behaviour rather than guess a conversion.
-            cpmp_value = limit_value
-
-        # Deliberately NOT part of the return value. The ceiling carries
-        # cpmp_value (the hardware maximum), not the requested limit, and once
-        # pinned it is served from cache on every subsequent call -- so folding
-        # it into the result would report success whenever the ceiling was
-        # merely unchanged, even if the requested limit never applied. Under
-        # upstream #2052 that would record a confirmed value the charger is not
-        # holding, which is the exact failure that guard exists to prevent.
-        cpmp_ok = await _apply_profile(
-            ChargingProfilePurposeType.charge_point_max_profile.value,
-            0,
-            value=cpmp_value,
-        )
-        if not cpmp_ok:
-            _LOGGER.warning(
-                "Could not set the station charging ceiling to %s; the session "
-                "is still bounded by the charger's own MaxCurrent setting.",
-                cpmp_value,
-            )
-
-        # With an active transaction, TxProfile is what affects the ongoing
-        # session.
         txp_ok = False
+        txd_ok = False
+
+        # If an active transaction exists on this connector, try TxProfile first (affects ongoing charging)
         if active_tx_id > 0:
-            txp_ok = await _apply_profile(
-                ChargingProfilePurposeType.tx_profile.value,
-                target_cid,
-                active_tx_id,
-            )
+            try:
+                req = call.SetChargingProfile(
+                    connector_id=target_cid,
+                    cs_charging_profiles={
+                        om.charging_profile_id: _profile_id(
+                            ChargingProfilePurposeType.tx_profile.value, target_cid
+                        ),
+                        om.stack_level: stack_level,
+                        om.charging_profile_kind: ChargingProfileKindType.relative.value,
+                        om.charging_profile_purpose: ChargingProfilePurposeType.tx_profile.value,
+                        om.charging_schedule: _mk_schedule(units_value, limit_value),
+                        # Bind to the ongoing transaction
+                        om.transaction_id: active_tx_id,
+                    },
+                )
+                resp = await self.call(req)
+                if resp.status == ChargingProfileStatus.accepted:
+                    txp_ok = True
+                    self._note_accepted_stack_level(stack_level)
+                else:
+                    _LOGGER.debug("TxProfile not accepted (%s).", resp.status)
+            except Exception as ex:
+                _LOGGER.debug("TxProfile call raised: %s.", ex)
 
-        # Always refresh TxDefaultProfile too, so a stale low value cannot cap
-        # the next session.
-        txd_ok = await _apply_profile(
-            ChargingProfilePurposeType.tx_default_profile.value, target_cid
-        )
-        if txp_ok and not txd_ok:
-            _LOGGER.debug(
-                "Active TxProfile applied, but TxDefaultProfile did not stick."
+        # Always attempt TxDefaultProfile as well (for future sessions)
+        try:
+            req = call.SetChargingProfile(
+                connector_id=target_cid,
+                cs_charging_profiles={
+                    om.charging_profile_id: _profile_id(
+                        ChargingProfilePurposeType.tx_default_profile.value, target_cid
+                    ),
+                    om.stack_level: stack_level,
+                    om.charging_profile_kind: ChargingProfileKindType.relative.value,
+                    om.charging_profile_purpose: ChargingProfilePurposeType.tx_default_profile.value,
+                    om.charging_schedule: _mk_schedule(units_value, limit_value),
+                },
             )
+            resp = await self.call(req)
+            if resp.status == ChargingProfileStatus.accepted:
+                txd_ok = True
+                self._note_accepted_stack_level(stack_level)
+            else:
+                _LOGGER.debug("Set TxDefaultProfile rejected: %s", resp.status)
+                if txp_ok:
+                    _LOGGER.debug(
+                        f"Note: Active TxProfile applied, but TxDefaultProfile was rejected ({resp.status})."
+                    )
+        except Exception as ex:
+            _LOGGER.debug("Set TxDefaultProfile failed: %s", ex)
+            if txp_ok:
+                _LOGGER.debug(
+                    f"Note: Active TxProfile applied, but TxDefaultProfile failed: {ex}"
+                )
 
-        # Success means the REQUESTED limit is in force, which only a
-        # Tx-purpose profile can establish. The caller treats False as a
-        # refusal and reverts the displayed value, so this must not report
-        # success on the strength of the ceiling alone.
         return bool(txp_ok or txd_ok)
 
     async def set_availability(self, state: bool = True, connector_id: int | None = 0):
@@ -741,7 +1345,7 @@ class ChargePoint(cp):
             target_str = "Operative" if state else "Inoperative"
             scope_str = "station" if conn == 0 else "connector"
 
-            metric_key = (conn, cstat.status_connector.value)
+            metric_key = (conn, cstat.status_connector)
             metric = self._metrics.get(metric_key)
 
             if status == AvailabilityStatus.scheduled:
@@ -779,6 +1383,12 @@ class ChargePoint(cp):
             connector_id=connector_id, id_tag=self._remote_id_tag
         )
         resp = await self.call(req)
+        _LOGGER.debug(
+            "RemoteStartTransaction to %s connector=%s answered: %s",
+            self.id,
+            connector_id,
+            resp,
+        )
         if resp.status == RemoteStartStopStatus.accepted:
             return True
         else:
@@ -793,7 +1403,11 @@ class ChargePoint(cp):
 
         If connector_id is provided, only stop the transaction running on that connector.
         """
-        # Resolve which transaction to stop
+        # Resolve which transaction to stop. An id a held connector may still
+        # own is never sent: with duplicate charger-supplied ids the stop could
+        # end another connector's running session, and this is the path the
+        # Charge Control switch takes, since it always names its connector.
+        unsafe = self._unsafe_transaction_ids()
         tx_id = 0
         if connector_id is not None:
             # Per-connector stop: do NOT fall back to other connectors
@@ -810,11 +1424,34 @@ class ChargePoint(cp):
                     n = 0
                 if n == 1 and int(connector_id) in (0, 1):
                     tx_id = int(self.active_transaction_id or 0)
+
+            if int(connector_id) in self._tx_indeterminate or tx_id in unsafe:
+                _LOGGER.warning(
+                    "%s: not stopping connector %s: its transaction state is "
+                    "unresolved until the charger reports its status",
+                    self.id,
+                    connector_id,
+                )
+                await self.notify_ha(
+                    f"Warning: Stop transaction on connector {connector_id} refused: "
+                    "transaction state unresolved"
+                )
+                return False
         else:
-            # Global stop (legacy behavior): stop the known active tx, or any active tx
-            tx_id = int(self.active_transaction_id or 0)
-            if tx_id == 0:
-                tx_id = next((int(v) for v in self._active_tx.values() if v), 0)
+            # Global stop (legacy behaviour): the known active transaction, or
+            # any active one - never an id a held connector may still own.
+            candidates = [
+                int(v)
+                for c, v in self._active_tx.items()
+                if v and c not in self._tx_indeterminate and int(v) not in unsafe
+            ]
+            legacy = int(self.active_transaction_id or 0)
+            if legacy in unsafe:
+                legacy = 0
+            if legacy and (legacy in candidates or not self._active_tx):
+                tx_id = legacy
+            else:
+                tx_id = candidates[0] if candidates else 0
 
         # Nothing to stop - succeed as no-op
         if tx_id == 0:
@@ -833,7 +1470,7 @@ class ChargePoint(cp):
 
     async def reset(self, typ: str = ResetType.hard):
         """Hard reset charger unless soft reset requested."""
-        self._metrics[0][cstat.reconnects.value].value = 0
+        self._metrics[0][cstat.reconnects].value = 0
         req = call.Reset(typ)
         resp = await self.call(req)
         if resp.status == ResetStatus.accepted:
@@ -921,10 +1558,8 @@ class ChargePoint(cp):
                 data,
                 resp.data,
             )
-            self._metrics[0][cdet.data_response.value].value = datetime.now(tz=UTC)
-            self._metrics[0][cdet.data_response.value].extra_attr = {
-                message_id: resp.data
-            }
+            self._metrics[0][cdet.data_response].value = datetime.now(tz=UTC)
+            self._metrics[0][cdet.data_response].extra_attr = {message_id: resp.data}
             return True
         else:
             _LOGGER.warning("Failed with response: %s", resp.status)
@@ -949,14 +1584,14 @@ class ChargePoint(cp):
                 result = {}
                 for entry in resp.configuration_key:
                     entry_key = entry.get("key", "")
-                    entry_value = entry.get(om.value.value, "")
+                    entry_value = entry.get(om.value, "")
                     result[entry_key] = entry_value
                 _LOGGER.debug("Get Configuration returned %d keys", len(result))
                 return result
-            value = resp.configuration_key[0][om.value.value]
+            value = resp.configuration_key[0][om.value]
             _LOGGER.debug("Get Configuration for %s: %s", key, value)
-            self._metrics[0][cdet.config_response.value].value = datetime.now(tz=UTC)
-            self._metrics[0][cdet.config_response.value].extra_attr = {key: value}
+            self._metrics[0][cdet.config_response].value = datetime.now(tz=UTC)
+            self._metrics[0][cdet.config_response].extra_attr = {key: value}
             return value
         if resp.unknown_key:
             _LOGGER.warning("Get Configuration returned unknown key for: %s", key)
@@ -990,7 +1625,7 @@ class ChargePoint(cp):
         for key_value in resp.configuration_key:
             # If the key already has the targeted value we don't need to set
             # it.
-            if key_value[om.key.value] == key and key_value[om.value.value] == value:
+            if key_value[om.key] == key and key_value[om.value] == value:
                 return
 
             if key_value.get(om.readonly.name, False):
@@ -1036,16 +1671,32 @@ class ChargePoint(cp):
     def on_meter_values(self, connector_id: int, meter_value: dict, **kwargs):
         """Request handler for MeterValues Calls (multi-connector aware)."""
 
+        self._ensure_tx_store_loaded()
         transaction_id: int = int(kwargs.get(om.transaction_id.name, 0) or 0)
+        if transaction_id:
+            # Seeing an id, including on closing values, is enough to keep a
+            # later allocation clear of it; it does not make the id live.
+            self._note_transaction_id(transaction_id)
+        if connector_id == 0:
+            # Connector 0 is the charge point itself and never runs a
+            # transaction. A charger may still tag its station meter with the
+            # running session's id; adopting it would record that id on two
+            # connectors, and the StopTransaction could then not be attributed.
+            transaction_id = 0
         tx_has_id: bool = transaction_id not in (None, 0)
+        tx_end_context = any(
+            sampled_value.get(om.context) == ReadingContext.transaction_end.value
+            for bucket in meter_value
+            for sampled_value in bucket.get(om.sampled_value.name, [])
+        )
 
         # Restore missing per-connector meter_start / active_transaction_id from HA if possible.
-        ms_key = (connector_id, csess.meter_start.value)
-        tx_key = (connector_id, csess.transaction_id.value)
-        session_key = (connector_id, csess.session_time.value)
+        ms_key = (connector_id, csess.meter_start)
+        tx_key = (connector_id, csess.transaction_id)
+        session_key = (connector_id, csess.session_time)
 
         if self._metrics[ms_key].value is None:
-            value = self.get_ha_metric(csess.meter_start.value, connector_id)
+            value = self.get_ha_metric(csess.meter_start, connector_id)
             if value is None:
                 m = self._metrics.get((connector_id, DEFAULT_MEASURAND))
                 value = m.value if m is not None else None
@@ -1054,7 +1705,7 @@ class ChargePoint(cp):
                     value = float(value)
                     _LOGGER.debug(
                         "%s[%s] was None, restored value=%s from HA.",
-                        csess.meter_start.value,
+                        csess.meter_start,
                         connector_id,
                         value,
                     )
@@ -1062,24 +1713,36 @@ class ChargePoint(cp):
                     value = None
             self._metrics[ms_key].value = value
 
+        if connector_id == 0 and self._metrics[tx_key].value is None:
+            # Nor may connector 0 restore one: its HA fallback is the flattened
+            # sensor, which on a single-connector charger shows connector 1's
+            # session.
+            self._metrics[tx_key].value = 0
+
         if self._metrics[tx_key].value is None:
-            value = self.get_ha_metric(csess.transaction_id.value, connector_id)
+            value = self.get_ha_metric(csess.transaction_id, connector_id)
             if value is None:
-                value = transaction_id if transaction_id else None
+                # A first sighting normally restores a transaction after a
+                # restart. Closing values are different: their id names a
+                # transaction that has already ended and must not revive it.
+                value = (
+                    transaction_id if transaction_id and not tx_end_context else None
+                )
             else:
                 try:
                     value = int(value)
                     _LOGGER.debug(
                         "%s[%s] was None, restored value=%s from HA.",
-                        csess.transaction_id.value,
+                        csess.transaction_id,
                         connector_id,
                         value,
                     )
                 except (ValueError, TypeError):
                     value = None
             self._metrics[tx_key].value = value
-            # Track active tx per connector
-            self._active_tx[connector_id] = value
+            # Track active tx per connector, and keep new ids clear of it
+            self._active_tx[connector_id] = int(value or 0)
+            self._note_transaction_id(value)
 
         if connector_id not in self._active_tx:
             try:
@@ -1090,12 +1753,39 @@ class ChargePoint(cp):
         recorded_tx = int(self._metrics[tx_key].value or 0)
         active_tx = int(self._active_tx.get(connector_id, 0) or 0)
 
+        # A transaction's closing values arrive after its StopTransaction, so
+        # adopting their id below would revive the session that just ended. A
+        # charger says so with a Transaction.End context, but OCPP leaves that
+        # field optional, so fall back to the id of the transaction we last saw
+        # stop on this connector. The context speaks only for the id it comes
+        # with: closing values for some other transaction, arriving while one
+        # is known on this connector, end nothing here.
+        current_tx = active_tx or recorded_tx
+        tx_ended: bool = (
+            bool(transaction_id)
+            and current_tx
+            in (
+                0,
+                transaction_id,
+            )
+            and (
+                transaction_id == int(self._ended_tx.get(connector_id, 0) or 0)
+                or tx_end_context
+            )
+        )
+
         # Self-heal after restart: adopt incoming txId if we have none recorded yet
-        if transaction_id and (recorded_tx == 0 and active_tx == 0):
+        if transaction_id and not tx_ended and (recorded_tx == 0 and active_tx == 0):
             self._metrics[tx_key].value = transaction_id
             self._active_tx[connector_id] = transaction_id
             active_tx = transaction_id
             recorded_tx = transaction_id
+            self._note_transaction_id(transaction_id)
+            # The charger chose this id, so it says nothing about when the
+            # session began; use the persisted start if this is the session
+            # that was running before the restart, else the first sighting.
+            self._ensure_session_start(connector_id, transaction_id)
+            self._schedule_tx_store_save()
             _LOGGER.debug(
                 "Restored transactionId=%s on conn %s from MeterValues.",
                 transaction_id,
@@ -1120,6 +1810,12 @@ class ChargePoint(cp):
         # Match is also false if no transaction is in progress, i.e. active_tx==transaction_id==0
         if transaction_id == active_tx and transaction_id != 0:
             transaction_matches = True
+        elif transaction_id != 0 and tx_ended:
+            # The closing values arrive once the transaction has been cleared, but
+            # they belong to it and carry its final energy figures. Treating them
+            # as outside a transaction would file session energy as lifetime
+            # energy on chargers that report the two in the same measurand.
+            transaction_matches = True
         elif transaction_id != 0 and active_tx != 0 and transaction_id != active_tx:
             _LOGGER.warning(
                 "Unknown transaction detected on conn %s with id=%i (expected %s)",
@@ -1132,17 +1828,17 @@ class ChargePoint(cp):
         for bucket in meter_value:
             measurands: list[MeasurandValue] = []
             for sampled_value in bucket.get(om.sampled_value.name, []):
-                measurand = sampled_value.get(om.measurand.value, None)
-                value = sampled_value.get(om.value.value, None)
+                measurand = sampled_value.get(om.measurand, None)
+                value = sampled_value.get(om.value, None)
                 # Where an empty string is supplied convert to 0
                 try:
                     value = float(value)
                 except (ValueError, TypeError):
                     value = 0.0
-                unit = sampled_value.get(om.unit.value, None)
-                phase = sampled_value.get(om.phase.value, None)
-                location = sampled_value.get(om.location.value, None)
-                context = sampled_value.get(om.context.value, None)
+                unit = sampled_value.get(om.unit, None)
+                phase = sampled_value.get(om.phase, None)
+                location = sampled_value.get(om.location, None)
+                context = sampled_value.get(om.context, None)
                 measurands.append(
                     MeasurandValue(measurand, value, phase, unit, context, location)
                 )
@@ -1150,30 +1846,38 @@ class ChargePoint(cp):
 
         self.process_measurands(meter_values, transaction_matches, connector_id)
 
-        if tx_has_id and transaction_matches:
-            try:
-                tx_start_epoch = float(self._metrics[tx_key].value)
-            except (TypeError, ValueError):
-                tx_start_epoch = time.time()
-            if tx_start_epoch > 0:
-                self._metrics[session_key].value = round(
-                    (time.time() - tx_start_epoch) / 60
-                )
-                self._metrics[session_key].unit = UnitOfTime.MINUTES
-            else:
-                _LOGGER.debug(
-                    "Skipping session time calc — invalid tx_start_epoch=%s",
-                    tx_start_epoch,
-                )
+        # The closing values are the last thing a charger sends for a session and
+        # they still carry the final current and power, so they would otherwise
+        # leave those sensors reading as though charging never stopped.
+        if tx_ended:
+            self._zero_flow_measurands(connector_id)
+
+        # A sample for the transaction a held connector still has settles it as
+        # running; the closing values of that transaction settle it as over.
+        if connector_id in self._tx_indeterminate and tx_has_id:
+            if tx_ended:
+                # The connector's own transaction is over, which is evidence
+                # of how it ended; an unattributed stop is not claimed here.
+                self._resolve_indeterminate(connector_id, running=False, claim=False)
+            elif transaction_matches:
+                self._resolve_indeterminate(connector_id, running=True)
+
+        # Session time comes from the recorded start, never from the id. The
+        # closing values leave the final figure alone. A held connector only
+        # gets here once the sample above has settled it as running, so its
+        # timer stands still until the charger says something about it.
+        if tx_has_id and transaction_matches and not tx_ended:
+            started_at = self._ensure_session_start(connector_id, transaction_id)
+            self._metrics[session_key].value = max(
+                0, round((time.time() - started_at) / 60)
+            )
+            self._metrics[session_key].unit = UnitOfTime.MINUTES
         self.hass.async_create_task(self.update(self.settings.cpid))
         return call_result.MeterValues()
 
     @on(Action.boot_notification)
     def on_boot_notification(self, **kwargs):
         """Handle a boot notification."""
-        # The charger restarted, so any cached charging-profile or
-        # configuration state is void.
-        self._invalidate_charging_profile_cache()
         resp = call_result.BootNotification(
             current_time=datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             interval=3600,
@@ -1182,6 +1886,7 @@ class ChargePoint(cp):
         self.received_boot_notification = True
         _LOGGER.debug("Received boot notification for %s: %s", self.id, kwargs)
 
+        self._ensure_tx_store_loaded()
         self.hass.async_create_task(self.async_update_device_info_v16(kwargs))
         self._register_boot_notification()
         return resp
@@ -1189,6 +1894,14 @@ class ChargePoint(cp):
     @on(Action.status_notification)
     def on_status_notification(self, connector_id, error_code, status, **kwargs):
         """Handle a status notification."""
+        _LOGGER.debug(
+            "Status notification from %s: connector=%s status=%s error_code=%s %s",
+            self.id,
+            connector_id,
+            status,
+            error_code,
+            kwargs,
+        )
 
         # BG Sync fork: some chargers carry vendor-specific fault detail
         # (vendorId/vendorErrorCode) and free-text info alongside the standard
@@ -1221,17 +1934,18 @@ class ChargePoint(cp):
             if status in (
                 ChargePointStatus.suspended_ev.value,
                 ChargePointStatus.suspended_evse.value,
+                ChargePointStatus.faulted.value,
             ):
-                for meas in [
-                    Measurand.current_import.value,
-                    Measurand.power_active_import.value,
-                    Measurand.power_reactive_import.value,
-                    Measurand.current_export.value,
-                    Measurand.power_active_export.value,
-                    Measurand.power_reactive_export.value,
-                ]:
-                    if meas in self._metrics[connector_id]:
-                        self._metrics[(connector_id, meas)].value = 0
+                self._zero_flow_measurands(connector_id)
+
+            # A connector held as unresolved after an unknown StopTransaction
+            # is settled only by a status that proves something: Faulted or
+            # Preparing leave it held rather than end a session that may be
+            # running.
+            if status in _TX_RUNNING_STATUSES:
+                self._resolve_indeterminate(connector_id, running=True)
+            elif status in _TX_ENDED_STATUSES:
+                self._resolve_indeterminate(connector_id, running=False)
 
         self.hass.async_create_task(self.update(self.settings.cpid))
         return call_result.StatusNotification()
@@ -1239,7 +1953,7 @@ class ChargePoint(cp):
     @on(Action.firmware_status_notification)
     def on_firmware_status(self, status, **kwargs):
         """Handle firmware status notification."""
-        self._metrics[0][cstat.firmware_status.value].value = status
+        self._metrics[0][cstat.firmware_status].value = status
         self.hass.async_create_task(self.update(self.settings.cpid))
         self.hass.async_create_task(self.notify_ha(f"Firmware upload status: {status}"))
         return call_result.FirmwareStatusNotification()
@@ -1270,50 +1984,70 @@ class ChargePoint(cp):
     @on(Action.authorize)
     def on_authorize(self, id_tag, **kwargs):
         """Handle an Authorization request."""
-        self._metrics[0][cstat.id_tag.value].value = id_tag
+        self._metrics[0][cstat.id_tag].value = id_tag
         auth_status = self.get_authorization_status(id_tag)
-        return call_result.Authorize(id_tag_info={om.status.value: auth_status})
+        return call_result.Authorize(id_tag_info={om.status: auth_status})
 
     @on(Action.start_transaction)
     def on_start_transaction(self, connector_id, id_tag, meter_start, **kwargs):
         """Handle a Start Transaction request."""
 
-        auth_status = self.get_authorization_status(id_tag)
+        self._ensure_tx_store_loaded()
+        auth_status = self.get_authorization_status(id_tag, connector_id)
         if auth_status == AuthorizationStatus.accepted.value:
-            tx_id = int(time.time())
+            tx_id = self._allocate_transaction_id()
+            self._ended_tx.pop(connector_id, None)
+            if connector_id in self._tx_indeterminate:
+                # Whatever it held has been superseded; a stop that named it
+                # can no longer be attributed to anyone.
+                self._tx_indeterminate.discard(connector_id)
+                self._invalidate_pending_stops(
+                    connector_id, "started a new transaction"
+                )
             self._active_tx[connector_id] = tx_id
-            # Any cached TxProfile limit was bound to the previous transaction
-            # id and must not be treated as still applied.
-            self._invalidate_charging_profile_cache()
             self.active_transaction_id = tx_id
-            self._metrics[(connector_id, cstat.id_tag.value)].value = id_tag
-            self._metrics[(connector_id, cstat.stop_reason.value)].value = ""
-            self._metrics[(connector_id, csess.transaction_id.value)].value = tx_id
+            self._set_session_start(connector_id, time.time(), estimated=False)
+            self._metrics[(connector_id, cstat.id_tag)].value = id_tag
+            # StartTransaction is not always preceded by Authorize (local
+            # authorization / cache). The HA IdTag sensor is charger-level
+            # (connector 0); only set it on a single-connector charger.
+            if self.settings.num_connectors == 1:
+                self._metrics[0][cstat.id_tag.value].value = id_tag
+            self._metrics[(connector_id, cstat.stop_reason)].value = ""
+            self._metrics[(connector_id, csess.transaction_id)].value = tx_id
             try:
                 meter_start_kwh = float(meter_start) / 1000.0
             except Exception:
                 meter_start_kwh = 0.0
-            self._metrics[
-                (connector_id, csess.meter_start.value)
-            ].value = meter_start_kwh
-            self._metrics[(connector_id, csess.meter_start.value)].unit = HA_ENERGY_UNIT
+            self._metrics[(connector_id, csess.meter_start)].value = meter_start_kwh
+            self._metrics[(connector_id, csess.meter_start)].unit = HA_ENERGY_UNIT
+            # The energy reporting mode is detected from MeterValues, so a
+            # detection made in an earlier transaction must not decide how
+            # this one is read. The flag is charger-wide, so it is kept while a
+            # transaction is still running on another connector: that session
+            # may be the one it was detected on. Connector 0 is the main meter
+            # and never holds a transaction of its own.
+            if not any(
+                tx
+                for conn, tx in self._active_tx.items()
+                if conn not in (0, connector_id)
+            ):
+                self._charger_reports_session_energy = False
 
-            self._metrics[(connector_id, csess.session_time.value)].value = 0
-            self._metrics[
-                (connector_id, csess.session_time.value)
-            ].unit = UnitOfTime.MINUTES
-            self._metrics[(connector_id, csess.session_energy.value)].value = 0.0
-            self._metrics[
-                (connector_id, csess.session_energy.value)
-            ].unit = HA_ENERGY_UNIT
+            self._metrics[(connector_id, csess.session_time)].value = 0
+            self._metrics[(connector_id, csess.session_time)].unit = UnitOfTime.MINUTES
+            self._metrics[(connector_id, csess.session_energy)].value = 0.0
+            self._metrics[(connector_id, csess.session_energy)].unit = HA_ENERGY_UNIT
 
+            self._schedule_tx_store_save()
+            self._report_transaction_start(connector_id, tx_id, connector_id)
             result = call_result.StartTransaction(
-                id_tag_info={om.status.value: AuthorizationStatus.accepted.value},
+                id_tag_info={om.status: AuthorizationStatus.accepted.value},
                 transaction_id=tx_id,
             )
         else:
             result = call_result.StartTransaction(
-                id_tag_info={om.status.value: auth_status},
+                id_tag_info={om.status: auth_status},
                 transaction_id=0,
             )
 
@@ -1324,61 +2058,63 @@ class ChargePoint(cp):
     def on_stop_transaction(self, meter_stop, timestamp, transaction_id, **kwargs):
         """Stop the current transaction (multi-connector)."""
 
-        # The charger discards the transaction-bound TxProfile when the
-        # transaction ends, so drop our record of what it holds. Verified on
-        # SL320S647: after a stop/start cycle Current.Offered rose from 16 A to
-        # 32 A because only the ceiling remained. The limit fails upward here,
-        # so this must not be skipped.
-        self._invalidate_charging_profile_cache()
-
-        # Resolve connector from active tx map
-        conn = next(
-            (c for c, tx in self._active_tx.items() if tx == transaction_id), None
-        )
+        self._ensure_tx_store_loaded()
+        conn = self._resolve_stop_connector(transaction_id)
         if conn is None:
-            _LOGGER.error(
-                "Stop transaction received for unknown transaction id=%i",
-                transaction_id,
-            )
-            conn = 1  # conservative fallback
-
-        # Reset active transaction (global + per-connector)
-        self._active_tx[conn] = 0
-        self.active_transaction_id = 0
-        self._metrics[(conn, cstat.id_tag.value)].value = ""
-        self._metrics[(conn, csess.transaction_id.value)].value = 0
-        self._metrics[(conn, cstat.stop_reason.value)].value = kwargs.get(
-            om.reason.name, None
-        )
-
-        ms_key = (conn, csess.meter_start.value)
-        if (
-            self._metrics[ms_key].value is not None
-            and not self._charger_reports_session_energy
-        ):
-            try:
-                session_kwh = int(meter_stop) / 1000.0 - float(
-                    self._metrics[ms_key].value
+            # Guessing here used to reset connector 1, ending a session that
+            # may still be running and filing another connector's energy
+            # against it. Hold every connector that could own this stop
+            # instead: its timer stops advancing and the next status report
+            # from the charger settles it.
+            live = self._live_connectors()
+            if live:
+                self._tx_indeterminate.update(live)
+                # Keep the stop's payload for whichever of them ended.
+                self._pending_stops.append(
+                    {
+                        "transaction_id": transaction_id,
+                        "meter_stop": meter_stop,
+                        "reason": kwargs.get(om.reason.name, None),
+                        "candidates": set(live),
+                    }
                 )
-            except Exception:
-                session_kwh = 0.0
-            self._metrics[(conn, csess.session_energy.value)].value = session_kwh
+                _LOGGER.warning(
+                    "%s: StopTransaction for unknown transaction id=%s; cannot "
+                    "tell which of connectors %s it ends, holding their session "
+                    "state until the charger reports their status",
+                    self.id,
+                    transaction_id,
+                    live,
+                )
+            else:
+                _LOGGER.warning(
+                    "%s: StopTransaction for unknown transaction id=%s with no "
+                    "transaction recorded on any connector; nothing to end",
+                    self.id,
+                    transaction_id,
+                )
+            self.hass.async_create_task(self.update(self.settings.cpid))
+            return call_result.StopTransaction(
+                id_tag_info={om.status: AuthorizationStatus.accepted.value}
+            )
 
-        for meas in [
-            Measurand.current_import.value,
-            Measurand.power_active_import.value,
-            Measurand.power_reactive_import.value,
-            Measurand.current_export.value,
-            Measurand.power_active_export.value,
-            Measurand.power_reactive_export.value,
-        ]:
-            key = (conn, meas)
-            if key in self._metrics:
-                self._metrics[key].value = 0
+        # Reset active transaction (global + per-connector). A stop that names
+        # this connector as a possible owner could have been a malformed
+        # duplicate of this one, so it is discarded rather than left for
+        # another connector to claim.
+        self._invalidate_pending_stops(conn, "received its own StopTransaction")
+        self._clear_transaction_state(
+            conn, transaction_id, kwargs.get(om.reason.name, None)
+        )
+        self.active_transaction_id = 0
+        self._apply_stop_energy(conn, meter_stop)
+
+        self._zero_flow_measurands(conn)
+        self._schedule_tx_store_save()
 
         self.hass.async_create_task(self.update(self.settings.cpid))
         return call_result.StopTransaction(
-            id_tag_info={om.status.value: AuthorizationStatus.accepted.value}
+            id_tag_info={om.status: AuthorizationStatus.accepted.value}
         )
 
     @on(Action.data_transfer)
@@ -1439,6 +2175,6 @@ class ChargePoint(cp):
     def on_heartbeat(self, **kwargs):
         """Handle a Heartbeat."""
         now = datetime.now(tz=UTC)
-        self._metrics[0][cstat.heartbeat.value].value = now
-        self.hass.async_create_task(self.update(self.settings.cpid))
+        self._metrics[0][cstat.heartbeat].value = now
+        self._async_refresh_metric_entities([cstat.heartbeat])
         return call_result.Heartbeat(current_time=now.strftime("%Y-%m-%dT%H:%M:%SZ"))
