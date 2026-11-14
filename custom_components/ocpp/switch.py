@@ -12,7 +12,7 @@ from homeassistant.components.switch import (
     SwitchEntityDescription,
 )
 from homeassistant.core import callback
-from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.util import slugify
@@ -60,6 +60,10 @@ class OcppSwitchDescription(SwitchEntityDescription):
     # Only offered on chargers whose reported model is in
     # SYNCEV_VENDOR_KEY_MODELS -- for vendor keys not present on every charger.
     model_gated: bool = False
+    single_connector_status_fallback: bool = False
+    # The switch acts on the connector's transaction, so it is unavailable
+    # while that transaction's state is held as unresolved (see ocppv16).
+    transaction_bound: bool = False
 
 
 SWITCHES: Final[list[OcppSwitchDescription]] = [
@@ -69,13 +73,14 @@ SWITCHES: Final[list[OcppSwitchDescription]] = [
         icon=ICON,
         on_action=HAChargerServices.service_charge_start.name,
         off_action=HAChargerServices.service_charge_stop.name,
-        metric_state=HAChargerStatuses.status_connector.value,
+        metric_state=HAChargerStatuses.status_connector,
         metric_condition=[
             ChargePointStatus.charging.value,
             ChargePointStatus.suspended_evse.value,
             ChargePointStatus.suspended_ev.value,
         ],
         per_connector=True,
+        transaction_bound=True,
     ),
     OcppSwitchDescription(
         key="availability",
@@ -83,10 +88,11 @@ SWITCHES: Final[list[OcppSwitchDescription]] = [
         icon=ICON,
         on_action=HAChargerServices.service_availability.name,
         off_action=HAChargerServices.service_availability.name,
-        metric_state=HAChargerStatuses.status.value,  # charger-level status
+        metric_state=HAChargerStatuses.status,  # charger-level status
         metric_condition=[ChargePointStatus.available.value],
         default_state=True,
         per_connector=False,
+        single_connector_status_fallback=True,
     ),
     OcppSwitchDescription(
         key="connnector_availability",
@@ -94,7 +100,7 @@ SWITCHES: Final[list[OcppSwitchDescription]] = [
         icon=ICON,
         on_action=HAChargerServices.service_availability.name,
         off_action=HAChargerServices.service_availability.name,
-        metric_state=HAChargerStatuses.status_connector.value,  # connector-level status
+        metric_state=HAChargerStatuses.status_connector,  # connector-level status
         metric_condition=[
             ChargePointStatus.available.value,
             ChargePointStatus.preparing.value,
@@ -103,6 +109,7 @@ SWITCHES: Final[list[OcppSwitchDescription]] = [
             ChargePointStatus.suspended_ev.value,
             ChargePointStatus.finishing.value,
             ChargePointStatus.reserved.value,
+            ChargePointStatus.faulted.value,  # a fault is not out of service
         ],
         default_state=True,
         per_connector=True,
@@ -188,6 +195,10 @@ async def async_setup_entry(hass, entry, async_add_devices):
         cp_settings = list(charger.values())[0]
         cpid = cp_settings[CONF_CPID]
 
+        charger_device_id = dr.async_get_device_id_by_identifier(
+            hass, (DOMAIN, cpid), config_entry_id=entry.entry_id
+        )
+
         num_connectors = 1
         for item in entry.data.get(CONF_CPIDS, []):
             for _, cfg in item.items():
@@ -232,6 +243,7 @@ async def async_setup_entry(hass, entry, async_add_devices):
                             desc,
                             connector_id=conn_id,
                             flatten_single=flatten_single,
+                            charger_device_id=charger_device_id,
                         )
                     )
             else:
@@ -242,6 +254,7 @@ async def async_setup_entry(hass, entry, async_add_devices):
                         desc,
                         connector_id=None,
                         flatten_single=False,
+                        charger_device_id=charger_device_id,
                     )
                 )
 
@@ -261,6 +274,7 @@ class ChargePointSwitch(SwitchEntity):
         description: OcppSwitchDescription,
         connector_id: int | None = None,
         flatten_single: bool = False,
+        charger_device_id: str | None = None,
     ):
         """Instantiate instance of a ChargePointSwitch."""
         self.cpid = cpid
@@ -280,11 +294,15 @@ class ChargePointSwitch(SwitchEntity):
         self._attr_unique_id = ".".join(parts)
         self._attr_name = self.entity_description.name
         if self.connector_id and not self._flatten_single:
-            self._attr_device_info = DeviceInfo(
-                identifiers={(DOMAIN, f"{cpid}-conn{self.connector_id}")},
-                name=f"{cpid} Connector {self.connector_id}",
-                via_device=(DOMAIN, cpid),
-            )
+            device_info: DeviceInfo = {
+                "identifiers": {(DOMAIN, f"{cpid}-conn{self.connector_id}")},
+                "name": f"{cpid} Connector {self.connector_id}",
+            }
+            if charger_device_id is not None:
+                device_info["via_device_id"] = charger_device_id
+            else:
+                device_info["via_device"] = (DOMAIN, cpid)
+            self._attr_device_info = DeviceInfo(**device_info)
         else:
             self._attr_device_info = DeviceInfo(
                 identifiers={(DOMAIN, cpid)},
@@ -311,6 +329,11 @@ class ChargePointSwitch(SwitchEntity):
         target_conn = (
             self.connector_id if self.entity_description.per_connector else None
         )
+        if (
+            self.entity_description.transaction_bound
+            and self.central_system.is_transaction_indeterminate(self.cpid, target_conn)
+        ):
+            return False
         return bool(self.central_system.get_available(self.cpid, target_conn))
 
     @property
@@ -337,18 +360,21 @@ class ChargePointSwitch(SwitchEntity):
         if self.entity_description.ocpp_key:
             return self._state
         if self.entity_description.metric_state is not None:
-            metric_conn = (
-                self.connector_id
-                if (
-                    self.entity_description.metric_state
-                    == HAChargerStatuses.status_connector.value
-                    or self.entity_description.per_connector
+            if self.entity_description.single_connector_status_fallback:
+                resp = self.central_system.get_availability_status(self.cpid)
+            else:
+                metric_conn = (
+                    self.connector_id
+                    if (
+                        self.entity_description.metric_state
+                        == HAChargerStatuses.status_connector
+                        or self.entity_description.per_connector
+                    )
+                    else None
                 )
-                else None
-            )
-            resp = self.central_system.get_metric(
-                self.cpid, self.entity_description.metric_state, metric_conn
-            )
+                resp = self.central_system.get_metric(
+                    self.cpid, self.entity_description.metric_state, metric_conn
+                )
             if self.entity_description.metric_condition is not None:
                 self._state = resp in self.entity_description.metric_condition
             else:
@@ -407,6 +433,28 @@ class ChargePointSwitch(SwitchEntity):
         """Return the connected ChargePoint for this cpid, or None."""
         cp_id = self.central_system.cpids.get(self.cpid, self.cpid)
         return self.central_system.charge_points.get(cp_id)
+
+    def _schedule_ocpp_refresh(self) -> None:
+        """Run a read-back as a background task that is cancelled on removal.
+
+        A read-back waits on the charger. As a plain hass task it blocked
+        shutdown and config entry unload for as long as the charger took to
+        answer, or forever when it had gone.
+        """
+        tasks = self.__dict__.setdefault("_refresh_tasks", set())
+        task = self.hass.async_create_background_task(
+            self._ocpp_refresh(), name=f"ocpp refresh {self.cpid}"
+        )
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Cancel any read-back still waiting on the charger."""
+        for task in list(self.__dict__.get("_refresh_tasks", ())):
+            task.cancel()
+        parent = getattr(super(), "async_will_remove_from_hass", None)
+        if parent is not None:
+            await parent()
 
     async def _ocpp_refresh(self) -> None:
         """Read the charger's current value for this key and reconcile."""
@@ -514,7 +562,7 @@ class ChargePointSwitch(SwitchEntity):
                 and self._raw_value is None
                 and self.central_system.get_available(self.cpid, None)
             ):
-                self.hass.async_create_task(self._ocpp_refresh())
+                self._schedule_ocpp_refresh()
 
         # subscribe to updates
         self.async_on_remove(async_dispatcher_connect(self.hass, DATA_UPDATED, update))
@@ -526,4 +574,4 @@ class ChargePointSwitch(SwitchEntity):
             # Sync with the charger's actual value rather than trusting
             # default_state -- it may already be in a non-default state from
             # before HA started.
-            self.hass.async_create_task(self._ocpp_refresh())
+            self._schedule_ocpp_refresh()

@@ -1,14 +1,14 @@
 """Test sensor for ocpp integration."""
 
 import asyncio
+import copy
 import websockets
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from homeassistant.const import ATTR_DEVICE_CLASS
+from homeassistant.helpers import entity_registry as er
 from homeassistant.components.sensor.const import (
     SensorDeviceClass,
     SensorStateClass,
-    ATTR_STATE_CLASS,
 )
 
 from custom_components.ocpp.const import CONF_NUM_CONNECTORS, DOMAIN as OCPP_DOMAIN
@@ -28,7 +28,7 @@ async def test_sensor(hass, socket_enabled):
 
     cp_id = "CP_1_sens"
     cpid = "test_cpid_sens"
-    data = MOCK_CONFIG_DATA.copy()
+    data = copy.deepcopy(MOCK_CONFIG_DATA)
     cp_data = MOCK_CONFIG_CP_APPEND.copy()
     cp_data[CONF_CPID] = cpid
     data[CONF_CPIDS].append({cp_id: cp_data})
@@ -52,16 +52,18 @@ async def test_sensor(hass, socket_enabled):
     ) as ws:
         # Wait for setup to complete
         await asyncio.sleep(1)
-        # Test reactive power sensor
-        state = hass.states.get(f"sensor.{cpid}_power_reactive_import")
-        assert (
-            state.attributes.get(ATTR_DEVICE_CLASS) == SensorDeviceClass.REACTIVE_POWER
-        )
-        assert state.attributes.get(ATTR_STATE_CLASS) == SensorStateClass.MEASUREMENT
-        # Test reactive energy sensor, not having own device class yet
-        state = hass.states.get(f"sensor.{cpid}_energy_reactive_import_register")
-        assert state.attributes.get(ATTR_DEVICE_CLASS) is None
-        assert state.attributes.get(ATTR_STATE_CLASS) is None
+        # BG Sync fork: these metrics are registered disabled by default, so
+        # check the registry entry rather than a state.
+        registry = er.async_get(hass)
+        entry = registry.async_get(f"sensor.{cpid}_power_reactive_import")
+        assert entry is not None
+        assert entry.original_device_class == SensorDeviceClass.REACTIVE_POWER
+        assert entry.capabilities.get("state_class") == SensorStateClass.MEASUREMENT
+        # Reactive energy sensor, not having its own device class yet
+        entry = registry.async_get(f"sensor.{cpid}_energy_reactive_import_register")
+        assert entry is not None
+        assert entry.original_device_class is None
+        assert not (entry.capabilities or {}).get("state_class")
 
         await ws.close()
 
@@ -74,7 +76,7 @@ async def test_sensor_entities_per_connector_created(hass, socket_enabled):
     cp_id = "CP_1_sens_mc"
     cpid = "test_cpid_sens_mc"
 
-    data = MOCK_CONFIG_DATA.copy()
+    data = copy.deepcopy(MOCK_CONFIG_DATA)
     cp_data = MOCK_CONFIG_CP_APPEND.copy()
     cp_data[CONF_CPID] = cpid
     cp_data[CONF_NUM_CONNECTORS] = 2  # ensure two connectors up front

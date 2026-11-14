@@ -1,5 +1,6 @@
 """Test ocpp config flow."""
 
+from copy import deepcopy
 from unittest.mock import patch
 
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -8,7 +9,11 @@ from homeassistant.data_entry_flow import InvalidData
 import pytest
 
 from custom_components.ocpp.const import (
+    CONF_ENABLE_HA_NOTIFICATIONS,
     CONF_NUM_CONNECTORS,
+    CONF_SESSION_LIMIT_DEFAULT_PROFILE,
+    CONF_STACK_LEVEL_BELOW_MAX,
+    CONF_THREE_PHASE_SUPPLY,
     DEFAULT_NUM_CONNECTORS,
     DOMAIN,
 )
@@ -106,6 +111,7 @@ async def test_successful_discovery_flow(hass, bypass_get_data):
     # Switch to manual measurand selection to test full flow
     cp_input = MOCK_CONFIG_CP.copy()
     cp_input[CONF_MONITORED_VARIABLES_AUTOCONFIG] = False
+    cp_input[CONF_ENABLE_HA_NOTIFICATIONS] = False
     result_cp = await hass.config_entries.flow.async_configure(
         result_disc["flow_id"], user_input=cp_input
     )
@@ -117,13 +123,14 @@ async def test_successful_discovery_flow(hass, bypass_get_data):
 
     # Check that the config flow is complete and a new entry is created with
     # the input data
-    flow_output = MOCK_CONFIG_FLOW.copy()
+    flow_output = deepcopy(MOCK_CONFIG_FLOW)
     flow_output[CONF_CPIDS][-1]["test_cp_id"][CONF_MONITORED_VARIABLES_AUTOCONFIG] = (
         False
     )
     flow_output[CONF_CPIDS][-1]["test_cp_id"][CONF_NUM_CONNECTORS] = (
         DEFAULT_NUM_CONNECTORS
     )
+    flow_output[CONF_CPIDS][-1]["test_cp_id"][CONF_ENABLE_HA_NOTIFICATIONS] = False
 
     assert result_meas["type"] == data_entry_flow.FlowResultType.ABORT
     entry = hass.config_entries._entries.get_entries_for_domain(DOMAIN)[0]
@@ -611,3 +618,56 @@ async def test_reconfigure_does_not_schedule_second_reload(hass, bypass_get_data
         "reconfigure scheduled its own reload; the update listener already "
         f"reloads the entry (scheduled={scheduled})"
     )
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        CONF_SESSION_LIMIT_DEFAULT_PROFILE,
+        CONF_STACK_LEVEL_BELOW_MAX,
+        CONF_THREE_PHASE_SUPPLY,
+    ],
+)
+async def test_discovery_flow_stores_newer_options_only_when_on(
+    hass, bypass_get_data, option
+):
+    """An enabled option is stored; the default (off) is not."""
+    config_entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_CONFIG_CS,
+        entry_id="test_cms_session_default",
+        title="test_cms_session_default",
+        version=2,
+        minor_version=0,
+    )
+    hass.data.setdefault(DOMAIN, {})
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+    entry = hass.config_entries._entries.get_entries_for_domain(DOMAIN)[0]
+
+    async def add(cp_id, cpid, enabled):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": config_entries.SOURCE_INTEGRATION_DISCOVERY},
+            data={"cp_id": cp_id, "entry": entry},
+        )
+        cp_input = {**MOCK_CONFIG_CP, CONF_CPID: cpid}
+        if enabled is not None:
+            cp_input[option] = enabled
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], user_input=cp_input
+        )
+        assert result["type"] == data_entry_flow.FlowResultType.ABORT
+
+    await add("cp_on", "cpid_on", True)
+    await add("cp_off", "cpid_off", False)
+    await add("cp_default", "cpid_default", None)
+    stored = {
+        cp_id: settings
+        for item in entry.data[CONF_CPIDS]
+        for cp_id, settings in item.items()
+    }
+    assert stored["cp_on"][option] is True
+    assert option not in stored["cp_off"]
+    assert option not in stored["cp_default"]

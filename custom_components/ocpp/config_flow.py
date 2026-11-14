@@ -5,7 +5,6 @@ from homeassistant.config_entries import (
     ConfigEntry,
     ConfigFlow,
     ConfigFlowResult,
-    CONN_CLASS_LOCAL_PUSH,
     OptionsFlow,
 )
 from homeassistant.core import callback
@@ -13,9 +12,11 @@ from homeassistant.helpers import config_validation as cv
 import voluptuous as vol
 
 from .const import (
+    CONF_CHARGE_POINT_MAX_PROFILE_ABSOLUTE,
     CONF_CPID,
     CONF_CPIDS,
     CONF_CSID,
+    CONF_ENABLE_HA_NOTIFICATIONS,
     CONF_FORCE_SMART_CHARGING,
     CONF_HOST,
     CONF_IDLE_INTERVAL,
@@ -26,16 +27,21 @@ from .const import (
     CONF_NUM_CONNECTORS,
     CONF_OCPP_VERSION,
     CONF_PORT,
+    CONF_SESSION_LIMIT_DEFAULT_PROFILE,
     CONF_SKIP_SCHEMA_VALIDATION,
     CONF_SSL,
     CONF_SSL_CERTFILE_PATH,
     CONF_SSL_KEYFILE_PATH,
+    CONF_STACK_LEVEL_BELOW_MAX,
+    CONF_THREE_PHASE_SUPPLY,
     CONF_WEBSOCKET_CLOSE_TIMEOUT,
     CONF_WEBSOCKET_PING_INTERVAL,
     CONF_WEBSOCKET_PING_TIMEOUT,
     CONF_WEBSOCKET_PING_TRIES,
+    DEFAULT_CHARGE_POINT_MAX_PROFILE_ABSOLUTE,
     DEFAULT_CPID,
     DEFAULT_CSID,
+    DEFAULT_ENABLE_HA_NOTIFICATIONS,
     DEFAULT_FORCE_SMART_CHARGING,
     DEFAULT_HOST,
     DEFAULT_IDLE_INTERVAL,
@@ -47,10 +53,13 @@ from .const import (
     DEFAULT_NUM_CONNECTORS,
     DEFAULT_OCPP_VERSION,
     DEFAULT_PORT,
+    DEFAULT_SESSION_LIMIT_DEFAULT_PROFILE,
     DEFAULT_SKIP_SCHEMA_VALIDATION,
     DEFAULT_SSL,
     DEFAULT_SSL_CERTFILE_PATH,
     DEFAULT_SSL_KEYFILE_PATH,
+    DEFAULT_STACK_LEVEL_BELOW_MAX,
+    DEFAULT_THREE_PHASE_SUPPLY,
     DEFAULT_WEBSOCKET_CLOSE_TIMEOUT,
     DEFAULT_WEBSOCKET_PING_INTERVAL,
     DEFAULT_WEBSOCKET_PING_TIMEOUT,
@@ -102,6 +111,21 @@ STEP_USER_CP_DATA_SCHEMA = vol.Schema(
         vol.Required(
             CONF_FORCE_SMART_CHARGING, default=DEFAULT_FORCE_SMART_CHARGING
         ): bool,
+        vol.Required(
+            CONF_CHARGE_POINT_MAX_PROFILE_ABSOLUTE,
+            default=DEFAULT_CHARGE_POINT_MAX_PROFILE_ABSOLUTE,
+        ): bool,
+        vol.Required(
+            CONF_SESSION_LIMIT_DEFAULT_PROFILE,
+            default=DEFAULT_SESSION_LIMIT_DEFAULT_PROFILE,
+        ): bool,
+        vol.Required(
+            CONF_STACK_LEVEL_BELOW_MAX, default=DEFAULT_STACK_LEVEL_BELOW_MAX
+        ): bool,
+        vol.Required(CONF_THREE_PHASE_SUPPLY, default=DEFAULT_THREE_PHASE_SUPPLY): bool,
+        vol.Required(
+            CONF_ENABLE_HA_NOTIFICATIONS, default=DEFAULT_ENABLE_HA_NOTIFICATIONS
+        ): bool,
     }
 )
 
@@ -113,12 +137,33 @@ STEP_USER_MEASURANDS_SCHEMA = vol.Schema(
 )
 
 
+# Options added after 0.12.0, stored only while they are on.
+_STORED_ONLY_WHEN_ON = (
+    CONF_SESSION_LIMIT_DEFAULT_PROFILE,
+    CONF_STACK_LEVEL_BELOW_MAX,
+    CONF_THREE_PHASE_SUPPLY,
+)
+
+
+def _store_only_when_on(settings: dict[str, Any]) -> dict[str, Any]:
+    """Drop the _STORED_ONLY_WHEN_ON options from a charger record while off.
+
+    Releases up to 0.12.0 expand the record into ChargerSystemSettings and
+    fail on a key they do not know. Leaving the options out while they are
+    off keeps a rollback safe for every charger that never enabled them.
+    """
+    return {
+        key: value
+        for key, value in settings.items()
+        if key not in _STORED_ONLY_WHEN_ON or value
+    }
+
+
 class ConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for OCPP."""
 
     VERSION = 2
-    MINOR_VERSION = 1
-    CONNECTION_CLASS = CONN_CLASS_LOCAL_PUSH
+    MINOR_VERSION = 3
 
     def __init__(self):
         """Initialize."""
@@ -252,10 +297,12 @@ class ConfigFlow(ConfigFlow, domain=DOMAIN):
                     errors["base"] = "duplicate_cpid"
 
             if not errors:
-                cp_data = {
-                    **user_input,
-                    CONF_NUM_CONNECTORS: self._detected_num_connectors,
-                }
+                cp_data = _store_only_when_on(
+                    {
+                        **user_input,
+                        CONF_NUM_CONNECTORS: self._detected_num_connectors,
+                    }
+                )
                 cpids_list = self._data.get(CONF_CPIDS, []).copy()
                 cpids_list.append({self._cp_id: cp_data})
                 self._data = {**self._data, CONF_CPIDS: cpids_list}
@@ -360,7 +407,9 @@ class OCPPOptionsFlow(OptionsFlow):
         cpids = [
             {
                 cp_id: (
-                    {**stored, **self._settings} if cp_id == self._cp_id else stored
+                    _store_only_when_on({**stored, **self._settings})
+                    if cp_id == self._cp_id
+                    else stored
                 )
                 for cp_id, stored in item.items()
             }
@@ -448,6 +497,39 @@ class OCPPOptionsFlow(OptionsFlow):
                     CONF_FORCE_SMART_CHARGING,
                     default=current.get(
                         CONF_FORCE_SMART_CHARGING, DEFAULT_FORCE_SMART_CHARGING
+                    ),
+                ): bool,
+                vol.Required(
+                    CONF_CHARGE_POINT_MAX_PROFILE_ABSOLUTE,
+                    default=current.get(
+                        CONF_CHARGE_POINT_MAX_PROFILE_ABSOLUTE,
+                        DEFAULT_CHARGE_POINT_MAX_PROFILE_ABSOLUTE,
+                    ),
+                ): bool,
+                vol.Required(
+                    CONF_SESSION_LIMIT_DEFAULT_PROFILE,
+                    default=current.get(
+                        CONF_SESSION_LIMIT_DEFAULT_PROFILE,
+                        DEFAULT_SESSION_LIMIT_DEFAULT_PROFILE,
+                    ),
+                ): bool,
+                vol.Required(
+                    CONF_STACK_LEVEL_BELOW_MAX,
+                    default=current.get(
+                        CONF_STACK_LEVEL_BELOW_MAX, DEFAULT_STACK_LEVEL_BELOW_MAX
+                    ),
+                ): bool,
+                vol.Required(
+                    CONF_THREE_PHASE_SUPPLY,
+                    default=current.get(
+                        CONF_THREE_PHASE_SUPPLY, DEFAULT_THREE_PHASE_SUPPLY
+                    ),
+                ): bool,
+                vol.Required(
+                    CONF_ENABLE_HA_NOTIFICATIONS,
+                    default=current.get(
+                        CONF_ENABLE_HA_NOTIFICATIONS,
+                        DEFAULT_ENABLE_HA_NOTIFICATIONS,
                     ),
                 ): bool,
             }

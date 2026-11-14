@@ -31,7 +31,16 @@
                     "monitored_variables_autoconfig": "Automatic detection of OCPP Measurands",
                     "idle_interval": "Charger idle sampling interval (seconds)",
                     "skip_schema_validation": "Skip OCPP schema validation",
-                    "force_smart_charging": "Force Smart Charging feature profile"
+                    "force_smart_charging": "Force Smart Charging feature profile",
+                    "charge_point_max_profile_absolute": "Send the station charging limit as an absolute schedule",
+                    "session_limit_default_profile": "Send Session Current Limit as a default profile, settable at any time",
+                    "stack_level_below_max": "Charger accepts only stack levels below its reported maximum (OCPP 1.6)",
+                    "three_phase_supply": "Charger is fed three-phase",
+                    "enable_ha_notifications": "Enable Home Assistant notifications"
+                },
+                "data_description": {
+                    "stack_level_below_max": "Send charging profiles one level below the ChargeProfileMaxStackLevel the charger reports. Enable it if the charger rejects profiles at the level it reports, as Timxon A0, Morek MEV11 and ABB Terra AC do.",
+                    "three_phase_supply": "Always convert limits between amps and watts for three phases, including after a restart before any meter values arrive. Enable it for a three-phase charger such as the Huawei SCharger-22KT, and leave it off on a single-phase supply. With it on, a single-phase car on a power-only charger could draw up to three times the current set. After changing it, set the current limits again."
                 }
             },
             "measurands": {
@@ -113,6 +122,15 @@
         },
         "set_charge_rate_error": {
             "message": "Failed to set charging current limit: {message}"
+        },
+        "invalid_custom_profile": {
+            "message": "Invalid custom charging profile: {message}"
+        },
+        "not_found": {
+            "message": "No charger found for device id {message}. Check the devid matches the HA charger id (cpid) or the OCPP charger id."
+        },
+        "ambiguous_devid": {
+            "message": "Charger id {message} is ambiguous: several central systems have a charger with that OCPP id. Use the HA charger id (cpid) instead, which is unique."
         }
     },
     "options": {
@@ -133,7 +151,16 @@
                     "monitored_variables_autoconfig": "Automatic detection of OCPP Measurands",
                     "idle_interval": "Charger idle sampling interval (seconds)",
                     "skip_schema_validation": "Skip OCPP schema validation",
-                    "force_smart_charging": "Force Smart Charging feature profile"
+                    "force_smart_charging": "Force Smart Charging feature profile",
+                    "charge_point_max_profile_absolute": "Send the station charging limit as an absolute schedule",
+                    "session_limit_default_profile": "Send Session Current Limit as a default profile, settable at any time",
+                    "stack_level_below_max": "Charger accepts only stack levels below its reported maximum (OCPP 1.6)",
+                    "three_phase_supply": "Charger is fed three-phase",
+                    "enable_ha_notifications": "Enable Home Assistant notifications"
+                },
+                "data_description": {
+                    "stack_level_below_max": "Send charging profiles one level below the ChargeProfileMaxStackLevel the charger reports. Enable it if the charger rejects profiles at the level it reports, as Timxon A0, Morek MEV11 and ABB Terra AC do.",
+                    "three_phase_supply": "Always convert limits between amps and watts for three phases, including after a restart before any meter values arrive. Enable it for a three-phase charger such as the Huawei SCharger-22KT, and leave it off on a single-phase supply. With it on, a single-phase car on a power-only charger could draw up to three times the current set. After changing it, set the current limits again."
                 }
             },
             "measurands": {
