@@ -78,7 +78,7 @@ SENSOR_NAME_OVERRIDES = {
 # dashboard tidy; re-enable per-entity in the HA UI if a different charger or
 # firmware starts reporting them.
 #
-# This is not guesswork. MeterValuesSampledData on SL320S647 reads exactly:
+# This is not guesswork. MeterValuesSampledData on the EVSC7S reads exactly:
 #   Energy.Active.Import.Register, Power.Active.Import, Current.Offered,
 #   Current.Import, Voltage, Temperature
 # and the key, though writable, rejects any attempt to add measurands outside

@@ -742,7 +742,7 @@ class ChargePoint(cp):
         await self.configure(
             ckey.clock_aligned_data_interval,
             str(self.settings.idle_interval),
-            # BG Sync fork: SL320S647 reports this key readonly:true (verified
+            # BG Sync fork: the EVSC7S reports this key readonly:true (verified
             # 2026-08-10 -- it is absent from the capped GetConfiguration dump
             # but readable by name). Upstream raises a persistent HA
             # notification for it on every single connect.
@@ -999,7 +999,7 @@ class ChargePoint(cp):
         # BG Sync fork: OCPP enforces multipleOf 0.1 on the schedule limit and
         # the ocpp library validates before it transmits. A raw float from a
         # solar controller (11.653986956521738) raised FormatViolationError
-        # and never reached the charger (SL320S647, 2026-08-10).
+        # and never reached the charger (the EVSC7S, 2026-08-10).
         limit_value = round(limit_value, 1)
 
         units_value = (
@@ -1010,7 +1010,7 @@ class ChargePoint(cp):
 
         # The 1.6 spec reads as both a maximum value and a count; some
         # chargers (Timxon A0, Morek MEV11, ABB Terra AC) take it as a count.
-        # BG Sync fork: Sync Energy chargers do the same (SL320S647 reports 5,
+        # BG Sync fork: Sync Energy chargers do the same (the EVSC7S reports 5,
         # rejects 5 and accepts 0-4 for every purpose), so they get the lower
         # level without the option. The option still works for a Sync model
         # that reports an unexpected vendor string.
@@ -1611,7 +1611,7 @@ class ChargePoint(cp):
         through to a ChangeConfiguration that cannot succeed. Set
         notify_on_readonly False for keys known to be read-only on a given
         charger, so a value written on every connect (ClockAlignedDataInterval
-        on SL320S647) does not raise a persistent HA notification every restart.
+        on the EVSC7S) does not raise a persistent HA notification every restart.
         """
         req = call.GetConfiguration(key=[key])
 
