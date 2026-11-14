@@ -3,7 +3,7 @@
 import asyncio
 import math
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 from websockets.protocol import State
@@ -19,6 +19,7 @@ from custom_components.ocpp.chargepoint import (
     MeasurandValue,
 )
 from custom_components.ocpp.const import (
+    DEFAULT_ENABLE_HA_NOTIFICATIONS,
     DOMAIN,
     CentralSystemSettings,
     ChargerSystemSettings,
@@ -36,6 +37,9 @@ from ocpp.charge_point import ChargePoint as LibCP
 from ocpp.exceptions import NotImplementedError as OcppNotImplementedError
 
 from .const import CONF_SSL_CERTFILE_PATH, CONF_SSL_KEYFILE_PATH
+
+
+ORIGINAL_NOTIFY_HA = ChargePoint.notify_ha
 
 
 # -----------------------------
@@ -59,7 +63,12 @@ def _mk_entry_data():
     }
 
 
-def _mk_cp(hass, *, version=OcppVersion.V201):
+def _mk_cp(
+    hass,
+    *,
+    version=OcppVersion.V201,
+    enable_ha_notifications=DEFAULT_ENABLE_HA_NOTIFICATIONS,
+):
     entry = MockConfigEntry(domain=DOMAIN, data=_mk_entry_data())
     centr = CentralSystemSettings(**entry.data)
     chg = ChargerSystemSettings(
@@ -71,11 +80,12 @@ def _mk_cp(hass, *, version=OcppVersion.V201):
         monitored_variables_autoconfig=False,
         skip_schema_validation=False,
         force_smart_charging=False,
+        enable_ha_notifications=enable_ha_notifications,
     )
     # Minimal fake connection
     conn = SimpleNamespace(state=State.CLOSED, close=lambda: asyncio.sleep(0))
     cp = ChargePoint("CP_A", conn, version, hass, entry, centr, chg)
-    cp._metrics[(0, csess.meter_start.value)].value = None
+    cp._metrics[(0, csess.meter_start)].value = None
     return cp
 
 
@@ -181,16 +191,20 @@ async def test_async_update_device_info_updates_metrics_and_registry(hass):
         firmware_version="1.2.3",
     )
 
-    assert cp._metrics[(0, cdet.model.value)].value == "Model X"
-    assert cp._metrics[(0, cdet.vendor.value)].value == "Acme"
-    assert cp._metrics[(0, cdet.firmware_version.value)].value == "1.2.3"
-    assert cp._metrics[(0, cdet.serial.value)].value == "SER123"
+    assert cp._metrics[(0, cdet.model)].value == "Model X"
+    assert cp._metrics[(0, cdet.vendor)].value == "Acme"
+    assert cp._metrics[(0, cdet.firmware_version)].value == "1.2.3"
+    assert cp._metrics[(0, cdet.serial)].value == "SER123"
 
     from homeassistant.helpers import device_registry
 
     dr = device_registry.async_get(hass)
-    dev = dr.async_get_device({(DOMAIN, "CP_ID"), (DOMAIN, "test_cpid")})
-    assert dev is not None
+    devs = dr.async_get_devices(
+        identifiers={(DOMAIN, "CP_ID"), (DOMAIN, "test_cpid")},
+        config_entry_id=entry.entry_id,
+    )
+    assert devs
+    dev = devs[0]
     assert dev.manufacturer == "Acme"
     assert dev.model == "Model X"
     assert dev.sw_version == "1.2.3"
@@ -207,6 +221,24 @@ def test_get_ha_metric_prefers_exact_entity(hass):
     assert cp.get_ha_metric("Voltage", connector_id=1) == "229.5"
     # With connector_id=None -> root entity
     assert cp.get_ha_metric("Voltage", connector_id=None) == "n/a"
+
+
+@pytest.mark.parametrize(
+    ("enable_notifications", "expected_service_calls"),
+    [(True, 1), (False, 0)],
+)
+async def test_notify_ha_respects_per_charger_preference(
+    hass, enable_notifications, expected_service_calls
+):
+    """Test every HA notification respects its charger's preference."""
+    cp = _mk_cp(hass, enable_ha_notifications=enable_notifications)
+    service_call = AsyncMock()
+
+    with patch.object(type(hass.services), "async_call", service_call):
+        result = await ORIGINAL_NOTIFY_HA(cp, "Test notification")
+
+    assert result is enable_notifications
+    assert service_call.await_count == expected_service_calls
 
 
 def _mv(measurand, value, phase=None, unit=None, context=None, location=None):
@@ -245,8 +277,8 @@ def test_get_energy_kwh_and_session_derive(hass):
     cp = _mk_cp(hass, version=OcppVersion.V201)  # != 1.6 to enable session derive
 
     # Starting meter (kWh)
-    cp._metrics[(1, csess.meter_start.value)].value = 10.0
-    cp._metrics[(1, csess.meter_start.value)].unit = HA_ENERGY_UNIT
+    cp._metrics[(1, csess.meter_start)].value = 10.0
+    cp._metrics[(1, csess.meter_start)].unit = HA_ENERGY_UNIT
 
     # Send EAIR in Wh (should normalize to kWh)
     mv = _mv(
@@ -259,10 +291,8 @@ def test_get_energy_kwh_and_session_derive(hass):
     assert cp._metrics[(1, "Energy.Active.Import.Register")].unit == HA_ENERGY_UNIT
 
     # Session energy derived = EAIR - meter_start
-    assert cp._metrics[(1, csess.session_energy.value)].value == pytest.approx(
-        0.5, 1e-12
-    )
-    assert cp._metrics[(1, csess.session_energy.value)].unit == HA_ENERGY_UNIT
+    assert cp._metrics[(1, csess.session_energy)].value == pytest.approx(0.5, 1e-12)
+    assert cp._metrics[(1, csess.session_energy)].unit == HA_ENERGY_UNIT
 
 
 @pytest.mark.asyncio
@@ -335,10 +365,8 @@ async def test_handle_call_wraps_notimplementederror_and_sends(hass):
 # stop() must always cancel tasks
 # -----------------------------
 def _mk_task():
-    """Return a task-like object that records cancellation."""
-    task = SimpleNamespace(cancelled=False)
-    task.cancel = lambda t=task: setattr(t, "cancelled", True)
-    return task
+    """Return real owned work so cancellation and settlement are exercised."""
+    return asyncio.create_task(asyncio.Event().wait())
 
 
 @pytest.mark.asyncio
@@ -362,9 +390,9 @@ async def test_stop_cancels_tasks_when_close_fails(hass):
     with pytest.raises(OSError):
         await cp.stop()
 
-    assert all(
-        task.cancelled for task in cp.tasks
-    ), "tasks must be cancelled even when the websocket close raises"
+    assert all(task.cancelled() for task in cp.tasks), (
+        "tasks must be cancelled even when the websocket close raises"
+    )
     assert cp.status == STATE_UNAVAILABLE
 
 
@@ -389,9 +417,9 @@ async def test_stop_cancels_tasks_when_close_is_cancelled(hass):
     with pytest.raises(asyncio.CancelledError):
         await cp.stop()
 
-    assert all(
-        task.cancelled for task in cp.tasks
-    ), "tasks must be cancelled even when the websocket close is cancelled"
+    assert all(task.cancelled() for task in cp.tasks), (
+        "tasks must be cancelled even when the websocket close is cancelled"
+    )
     assert cp.status == STATE_UNAVAILABLE
 
 
@@ -422,4 +450,4 @@ async def test_stop_closes_connection_and_cancels_tasks(hass):
     await cp.stop()
 
     assert closed == [True]
-    assert all(task.cancelled for task in cp.tasks)
+    assert all(task.cancelled() for task in cp.tasks)

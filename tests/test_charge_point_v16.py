@@ -10,12 +10,15 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from pytest_homeassistant_custom_component.common import async_capture_events
+from homeassistant.const import STATE_ON, UnitOfTime
 from homeassistant.exceptions import HomeAssistantError
 import websockets
 
 from custom_components.ocpp.api import CentralSystem
 from custom_components.ocpp.button import BUTTONS
 from custom_components.ocpp.chargepoint import Metric as M
+from custom_components.ocpp.sensor import DISABLED_BY_DEFAULT_METRICS
 from custom_components.ocpp.const import (
     DOMAIN as OCPP_DOMAIN,
     CONF_CPIDS,
@@ -218,11 +221,21 @@ async def test_services(hass, cpid, serv_list, socket_enabled):
     )
 
     for number in NUMBERS:
+        # BG Sync fork: configuration-key numbers have their own ranges and
+        # are not charge-rate sliders.
+        if number.ocpp_key:
+            continue
         # test setting value of number slider
         await set_number(hass, cpid, number.key, 10)
 
 
 test_services.__test__ = False
+
+
+async def _assert_services_reject_devid(hass, devid, serv_list, socket_enabled):
+    """Every service must refuse a supplied devid that matches no charger."""
+    with pytest.raises(HomeAssistantError):
+        await test_services(hass, devid, serv_list, socket_enabled)
 
 
 # @pytest.mark.skip(reason="skip")
@@ -408,9 +421,17 @@ async def test_cms_responses_normal_v16(
         await cp.send_firmware_status()
         await cp.send_data_transfer()
         await cp.send_start_transaction(12345)
+        assert (
+            cs.charge_points[cp_id]._metrics[(1, csess.session_time)].unit
+            == UnitOfTime.MINUTES
+        )
         await cp.send_meter_err_phases()
         await cp.send_meter_line_voltage()
         await cp.send_meter_periodic_data()
+        assert (
+            cs.charge_points[cp_id]._metrics[(1, csess.session_time)].unit
+            == UnitOfTime.MINUTES
+        )
         # add delay to allow meter data to be processed
         await cp.send_stop_transaction(1)
 
@@ -643,9 +664,11 @@ async def test_cms_responses_errors_v16(
                         cs.charge_points[cp_id].settings.cpid,
                         socket_enabled,
                     ),
-                    test_services(
+                    # A devid that was supplied but matches no charger must
+                    # raise rather than fall through to an arbitrary one.
+                    _assert_services_reject_devid(
                         hass,
-                        "xxx",  # Test with incorrect devid supplied
+                        "xxx",
                         SERVICES_ERROR,
                         socket_enabled,
                     ),
@@ -782,7 +805,7 @@ async def test_clear_profile_v16(hass, socket_enabled, cp_id, port, setup_config
         # Minimal clear: no filters -> clears any CS/CP max profiles
         await hass.services.async_call(
             OCPP_DOMAIN,
-            csvcs.service_clear_profile.value,
+            csvcs.service_clear_profile,
             service_data={"devid": cpid},
             blocking=True,
         )
@@ -838,8 +861,8 @@ async def test_stop_transaction_paths_v16_b(
         await cp.send_boot_notification()
         await wait_ready(cs.charge_points[cp_id])
 
-        cs.charge_points[cp_id]._charger_reports_session_energy = True
         await cp.send_start_transaction(meter_start=0)
+        cs.charge_points[cp_id]._charger_reports_session_energy = True
 
         m = cs.charge_points[cp_id]._metrics
         # Pre-set SessionEnergy (should remain unchanged)
@@ -909,6 +932,9 @@ async def test_stop_transaction_paths_v16_c(
                 "Power.Active.Export",
                 "Power.Reactive.Export",
             ]:
+                if meas.lower() in DISABLED_BY_DEFAULT_METRICS:
+                    # BG Sync fork: registered disabled, so never populated.
+                    continue
                 assert float(cs.get_metric(cpid, meas)) == 0.0
 
             # Optional: stop reason captured
@@ -1450,7 +1476,7 @@ async def test_get_diagnostics_and_data_transfer_v16(
         upload_url = "https://example.test/diag"
         await hass.services.async_call(
             OCPP_DOMAIN,
-            csvcs.service_get_diagnostics.value,
+            csvcs.service_get_diagnostics,
             service_data={"devid": cpid, "upload_url": upload_url},
             blocking=True,
         )
@@ -1461,7 +1487,7 @@ async def test_get_diagnostics_and_data_transfer_v16(
         payload = '{"hello":"world"}'
         await hass.services.async_call(
             OCPP_DOMAIN,
-            csvcs.service_data_transfer.value,
+            csvcs.service_data_transfer,
             service_data={
                 "devid": cpid,
                 "vendor_id": vendor_id,
@@ -1482,7 +1508,7 @@ async def test_get_diagnostics_and_data_transfer_v16(
         cp.accept = False
         await hass.services.async_call(
             OCPP_DOMAIN,
-            csvcs.service_data_transfer.value,
+            csvcs.service_data_transfer,
             service_data={
                 "devid": cpid,
                 "vendor_id": "VendorX",
@@ -1498,13 +1524,13 @@ async def test_get_diagnostics_and_data_transfer_v16(
         caplog.set_level(logging.WARNING)
         await hass.services.async_call(
             OCPP_DOMAIN,
-            csvcs.service_get_diagnostics.value,
+            csvcs.service_get_diagnostics,
             service_data={"devid": cpid, "upload_url": "not-a-valid-url"},
             blocking=True,
         )
-        assert any(
-            "Failed to parse url" in rec.message for rec in caplog.records
-        ), "Expected warning for invalid diagnostics upload_url not found"
+        assert any("Failed to parse url" in rec.message for rec in caplog.records), (
+            "Expected warning for invalid diagnostics upload_url not found"
+        )
 
         # --- get_diagnostics: FW profile NOT supported branch ---
         # Simulate that FirmwareManagement profile is not supported by the CP
@@ -1525,7 +1551,7 @@ async def test_get_diagnostics_and_data_transfer_v16(
         # Valid URL, but without FW support the handler should skip/return gracefully
         await hass.services.async_call(
             OCPP_DOMAIN,
-            csvcs.service_get_diagnostics.value,
+            csvcs.service_get_diagnostics,
             service_data={"devid": cpid, "upload_url": "https://example.com/diag2"},
             blocking=True,
         )
@@ -1567,10 +1593,12 @@ async def test_monitor_connection_timeout_branch(
 
         from custom_components.ocpp import chargepoint as cp_mod
 
-        async def noop_task(_coro):
-            return None
-
-        monkeypatch.setattr(srv_cp.hass, "async_create_task", noop_task, raising=True)
+        monkeypatch.setattr(
+            cp_mod,
+            "async_dispatcher_send",
+            lambda *args, **kwargs: None,
+            raising=True,
+        )
 
         async def fast_sleep(_):
             return None  # skip the initial sleep(10) and interval sleeps
@@ -1642,6 +1670,7 @@ async def test_get_authorization_status_with_auth_list(
         CONF_AUTH_LIST,
         CONF_ID_TAG,
         CONF_AUTH_STATUS,
+        EVENT_AUTHORIZATION,
     )
 
     # Start a minimal client so the server-side CP is registered.
@@ -1672,6 +1701,8 @@ async def test_get_authorization_status_with_auth_list(
         {CONF_ID_TAG: "TAG_NO_STATUS"},  # should fall back to default
     ]
 
+    events = async_capture_events(hass, EVENT_AUTHORIZATION)
+
     # 1) Early return path: remote id tag
     srv_cp._remote_id_tag = "REMOTE123"
     assert (
@@ -1695,6 +1726,30 @@ async def test_get_authorization_status_with_auth_list(
     assert (
         srv_cp.get_authorization_status("UNKNOWN") == AuthorizationStatus.blocked.value
     )
+
+    # 5) StartTransaction passes its connector
+    assert (
+        srv_cp.get_authorization_status("TAG_PRESENT", 2)
+        == AuthorizationStatus.expired.value
+    )
+
+    # Every decision is fired as an event, including the remote id tag
+    await hass.async_block_till_done()
+    assert [e.data for e in events] == [
+        {
+            "charge_point_id": cp_id,
+            "connector_id": connector_id,
+            "id_tag": id_tag,
+            "authorization_status": status,
+        }
+        for id_tag, status, connector_id in (
+            ("REMOTE123", AuthorizationStatus.accepted.value, None),
+            ("TAG_PRESENT", AuthorizationStatus.expired.value, None),
+            ("TAG_NO_STATUS", AuthorizationStatus.blocked.value, None),
+            ("UNKNOWN", AuthorizationStatus.blocked.value, None),
+            ("TAG_PRESENT", AuthorizationStatus.expired.value, 2),
+        )
+    ]
 
 
 @pytest.mark.timeout(20)
@@ -2071,28 +2126,23 @@ async def test_on_diagnostics_status_notification(
             captured = {"called": 0, "msg": None}
 
             async def fake_notify(msg: str, title: str = "Ocpp integration"):
-                # record the message; return True like the real notifier
+                # Count the actual notification. The previous version
+                # counted hass.async_create_task calls as a proxy, which
+                # broke on HA 2026.8: entity updates now route through
+                # the same method, so unrelated tasks landed in the count.
+                captured["called"] += 1
                 captured["msg"] = msg
                 return True
 
-            def fake_async_create_task(coro):
-                # actually schedule the coroutine so fake_notify runs
-                captured["called"] += 1
-                return asyncio.create_task(coro)
-
             monkeypatch.setattr(srv_cp, "notify_ha", fake_notify, raising=True)
-            monkeypatch.setattr(
-                srv_cp.hass, "async_create_task", fake_async_create_task, raising=True
-            )
 
             # trigger server handler
             req = call.DiagnosticsStatusNotification(status="Uploaded")
             resp = await cp.call(req)
             assert resp is not None  # server replied
 
-            # ensure notify_ha ran and message content is correct
-            # give the task a tick to run
-            await asyncio.sleep(0)
+            # let the scheduled notify task actually run
+            await hass.async_block_till_done()
             assert captured["called"] == 1
             assert captured["msg"] == "Diagnostics upload status: Uploaded"
 
@@ -2188,9 +2238,9 @@ async def test_current_import_phase_extra_attrs_single_and_multi_connector(
             if num_connectors == 1:
                 # Without connector_id -> should resolve (fallback) to connector 1
                 attrs = cs.get_extra_attr(cp_id, "Current.Import", connector_id=None)
-                assert (
-                    attrs is not None
-                ), "Expected extra_attr dict for single-connector"
+                assert attrs is not None, (
+                    "Expected extra_attr dict for single-connector"
+                )
                 assert attrs.get("L1") == 5.0
                 assert attrs.get("L2") == 7.0
                 assert attrs.get("L3") == 8.0
@@ -2207,9 +2257,9 @@ async def test_current_import_phase_extra_attrs_single_and_multi_connector(
                 attrs1 = cs.get_extra_attr(cp_id, "Current.Import", connector_id=1)
                 attrs2 = cs.get_extra_attr(cp_id, "Current.Import", connector_id=2)
 
-                assert (
-                    attrs1 is not None and attrs2 is not None
-                ), "Expected extra_attr dicts for both connectors"
+                assert attrs1 is not None and attrs2 is not None, (
+                    "Expected extra_attr dicts for both connectors"
+                )
 
                 # Connector 1 values
                 assert attrs1.get("L1") == 5.0
@@ -2324,6 +2374,58 @@ async def test_set_availability_exception_branch(
             cp_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await cp_task
+            await ws.close()
+
+
+@pytest.mark.timeout(15)
+@pytest.mark.parametrize(
+    "setup_config_entry",
+    [
+        {
+            "port": 9397,
+            "cp_id": "CP_availability_status_fallback",
+            "cms": "cms_availability_status_fallback",
+        }
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize("cp_id", ["CP_availability_status_fallback"])
+@pytest.mark.parametrize("port", [9397])
+async def test_availability_switch_falls_back_from_real_v16_status_handler(
+    hass, socket_enabled, cp_id, port, setup_config_entry
+):
+    """A connector-1 notification drives availability without mirroring Status."""
+    cs = setup_config_entry
+
+    async with websockets.connect(
+        f"ws://127.0.0.1:{port}/{cp_id}", subprotocols=["ocpp1.6"]
+    ) as ws:
+        client = ChargePoint(f"{cp_id}_client", ws)
+        task = asyncio.create_task(client.start())
+        try:
+            await client.send_boot_notification()
+            await wait_ready(cs.charge_points[cp_id])
+            server = cs.charge_points[cp_id]
+
+            assert server._metrics[(0, cstat.status)].value is None
+            await client.call(
+                call.StatusNotification(
+                    connector_id=1,
+                    error_code=ChargePointErrorCode.no_error,
+                    status=ChargePointStatus.available,
+                    timestamp=datetime.now(tz=UTC).isoformat(),
+                )
+            )
+            await hass.async_block_till_done()
+
+            state = hass.states.get("switch.test_cpid_availability")
+            assert state is not None
+            assert state.state == STATE_ON
+            assert server._metrics[(0, cstat.status)].value is None
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
             await ws.close()
 
 
@@ -2498,9 +2600,9 @@ async def test_set_charge_rate_units_none_fallback_to_amps_and_accept_first(
             await wait_ready(cs.charge_points[cp_id])
             srv_cp: ServerCP = cs.charge_points[cp_id]
 
-            # Force fallback path
+            # Force the unit fallback; the stack level has no fallback.
             async def fake_get_conf(key):
-                return None
+                return "3" if key == "ChargeProfileMaxStackLevel" else None
 
             monkeypatch.setattr(
                 srv_cp, "get_configuration", fake_get_conf, raising=True
@@ -2671,6 +2773,148 @@ async def test_on_meter_values_tx_updates_connector_and_session_energy(
 @pytest.mark.timeout(10)
 @pytest.mark.parametrize(
     "setup_config_entry",
+    [{"port": 9404, "cp_id": "CP_eair_l1_n", "cms": "cms_eair_l1_n"}],
+    indirect=True,
+)
+@pytest.mark.parametrize("cp_id", ["CP_eair_l1_n"])
+@pytest.mark.parametrize("port", [9404])
+async def test_session_energy_from_single_l1_n_register(
+    hass, socket_enabled, cp_id, port, setup_config_entry
+):
+    """An isolated L1-N lifetime register updates session energy (#2213)."""
+    cs = setup_config_entry
+    async with websockets.connect(
+        f"ws://127.0.0.1:{port}/{cp_id}", subprotocols=["ocpp1.6"]
+    ) as ws:
+        cp = ChargePoint(f"{cp_id}_client", ws, no_connectors=1)
+        task = asyncio.create_task(cp.start())
+        try:
+            await cp.send_boot_notification()
+            await wait_ready(cs.charge_points[cp_id])
+            await cp.send_start_transaction(meter_start=15203)
+            await cp.call(
+                call.MeterValues(
+                    connector_id=1,
+                    transaction_id=cp.active_transactionId,
+                    meter_value=[
+                        {
+                            "timestamp": datetime.now(tz=UTC).isoformat(),
+                            "sampledValue": [
+                                {
+                                    "measurand": "Energy.Active.Import.Register",
+                                    "unit": "Wh",
+                                    "value": "15845",
+                                    "phase": "L1-N",
+                                }
+                            ],
+                        }
+                    ],
+                )
+            )
+            cpid = cs.charge_points[cp_id].settings.cpid
+            assert cs.get_metric(
+                cpid, "Energy.Session", connector_id=1
+            ) == pytest.approx(0.642)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            await ws.close()
+
+
+@pytest.mark.timeout(20)
+@pytest.mark.parametrize(
+    "setup_config_entry",
+    [{"port": 9106, "cp_id": "CP_tx_end", "cms": "cms_tx_end"}],
+    indirect=True,
+)
+@pytest.mark.parametrize("cp_id", ["CP_tx_end"])
+@pytest.mark.parametrize("port", [9106])
+async def test_on_meter_values_closing_values_after_stop(
+    hass, socket_enabled, cp_id, port, setup_config_entry
+):
+    """Closing values must end the session without reviving it or moving its energy.
+
+    A charger sends the Transaction.End values after StopTransaction. They still
+    belong to the transaction, so on a charger that reports session energy in the
+    energy register they must land in Energy.Session and leave the lifetime
+    register alone, and they must not restore the transaction that just ended.
+    """
+
+    cs: CentralSystem = setup_config_entry
+    async with websockets.connect(
+        f"ws://127.0.0.1:{port}/{cp_id}", subprotocols=["ocpp1.6"]
+    ) as ws:
+        cp = ChargePoint(f"{cp_id}_client", ws)
+        task = asyncio.create_task(cp.start())
+        try:
+            await cp.send_boot_notification()
+            await wait_ready(cs.charge_points[cp_id])
+
+            # meter_start of 0 marks a charger that reports session energy in the
+            # energy register rather than a lifetime total.
+            await cp.send_start_transaction(meter_start=0)
+
+            async def send_eair(context: str | None, kwh: str):
+                sampled = {
+                    "measurand": "Energy.Active.Import.Register",
+                    "unit": "kWh",
+                    "value": kwh,
+                }
+                if context is not None:
+                    sampled["context"] = context
+                await cp.call(
+                    call.MeterValues(
+                        connector_id=1,
+                        transaction_id=cp.active_transactionId,
+                        meter_value=[
+                            {
+                                "timestamp": datetime.now(tz=UTC).isoformat(),
+                                "sampledValue": [sampled],
+                            }
+                        ],
+                    )
+                )
+
+            await send_eair("Sample.Periodic", "2.0")
+            assert cs.get_metric(
+                cp_id, "Energy.Session", connector_id=1
+            ) == pytest.approx(2.0, rel=1e-6)
+            lifetime_before = cs.get_metric(
+                cp_id, "Energy.Active.Import.Register", connector_id=1
+            )
+
+            await cp.send_stop_transaction()
+            await send_eair("Transaction.End", "2.5")
+
+            assert cs.get_metric(cp_id, "Transaction.Id", connector_id=1) == 0
+            assert cs.get_metric(
+                cp_id, "Energy.Session", connector_id=1
+            ) == pytest.approx(2.5, rel=1e-6)
+            assert (
+                cs.get_metric(cp_id, "Energy.Active.Import.Register", connector_id=1)
+                == lifetime_before
+            )
+
+            # The context field is optional in OCPP 1.6, so a trailing reading
+            # that omits it must be recognised by its transaction id alone.
+            await send_eair(None, "2.6")
+            assert cs.get_metric(cp_id, "Transaction.Id", connector_id=1) == 0
+            assert (
+                cs.get_metric(cp_id, "Energy.Active.Import.Register", connector_id=1)
+                == lifetime_before
+            )
+
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            await ws.close()
+
+
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize(
+    "setup_config_entry",
     [{"port": 9099, "cp_id": "CP_eair_prio", "cms": "cms_eair_prio"}],
     indirect=True,
 )
@@ -2810,7 +3054,7 @@ async def test_trigger_status_single_accepts(
 
             srv_cp = cs.charge_points[cp_id]
             # force single connector
-            srv_cp._metrics[0][cdet.connectors.value].value = 1
+            srv_cp._metrics[0][cdet.connectors].value = 1
 
             async def fake_call(req):
                 if isinstance(req, call.TriggerMessage):
@@ -2823,7 +3067,7 @@ async def test_trigger_status_single_accepts(
             ok = await srv_cp.trigger_status_notification()
             assert ok is True
             assert attempts == [1]
-            assert int(srv_cp._metrics[0][cdet.connectors.value].value) == 1
+            assert int(srv_cp._metrics[0][cdet.connectors].value) == 1
         finally:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -2856,7 +3100,7 @@ async def test_trigger_status_multi_all_accepts(
             await wait_ready(cs.charge_points[cp_id])
 
             srv_cp = cs.charge_points[cp_id]
-            srv_cp._metrics[0][cdet.connectors.value].value = 2
+            srv_cp._metrics[0][cdet.connectors].value = 2
 
             async def fake_call(req):
                 if isinstance(req, call.TriggerMessage):
@@ -2869,7 +3113,7 @@ async def test_trigger_status_multi_all_accepts(
             ok = await srv_cp.trigger_status_notification()
             assert ok is True
             assert attempts == [0, 1, 2]
-            assert srv_cp._metrics[0][cdet.connectors.value].value == 2
+            assert srv_cp._metrics[0][cdet.connectors].value == 2
         finally:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -2902,7 +3146,7 @@ async def test_trigger_status_reject_zero_but_accept_rest(
             await wait_ready(cs.charge_points[cp_id])
 
             srv_cp = cs.charge_points[cp_id]
-            srv_cp._metrics[0][cdet.connectors.value].value = 2
+            srv_cp._metrics[0][cdet.connectors].value = 2
 
             async def fake_call(req):
                 if isinstance(req, call.TriggerMessage):
@@ -2918,7 +3162,7 @@ async def test_trigger_status_reject_zero_but_accept_rest(
             assert ok is True
             assert attempts == [0, 1, 2]
             # should not downgrade connector count because only cid=0 rejected
-            assert int(srv_cp._metrics[0][cdet.connectors.value].value) == 2
+            assert int(srv_cp._metrics[0][cdet.connectors].value) == 2
         finally:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -2951,7 +3195,7 @@ async def test_trigger_status_reject_nonzero_adjusts_and_stops(
             await wait_ready(cs.charge_points[cp_id])
 
             srv_cp = cs.charge_points[cp_id]
-            srv_cp._metrics[0][cdet.connectors.value].value = 3
+            srv_cp._metrics[0][cdet.connectors].value = 3
 
             async def fake_call(req):
                 if isinstance(req, call.TriggerMessage):
@@ -2967,7 +3211,7 @@ async def test_trigger_status_reject_nonzero_adjusts_and_stops(
             assert ok is False
             assert attempts == [0, 1, 2]
             # reduced to cid-1 => 1
-            assert int(srv_cp._metrics[0][cdet.connectors.value].value) == 1
+            assert int(srv_cp._metrics[0][cdet.connectors].value) == 1
         finally:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -3000,7 +3244,7 @@ async def test_trigger_status_timeout_on_zero_continues(
             await wait_ready(cs.charge_points[cp_id])
 
             srv_cp = cs.charge_points[cp_id]
-            srv_cp._metrics[0][cdet.connectors.value].value = 2
+            srv_cp._metrics[0][cdet.connectors].value = 2
 
             async def fake_call(req):
                 if isinstance(req, call.TriggerMessage):
@@ -3015,7 +3259,7 @@ async def test_trigger_status_timeout_on_zero_continues(
             ok = await srv_cp.trigger_status_notification()
             assert ok is True
             assert attempts == [0, 1, 2]
-            assert int(srv_cp._metrics[0][cdet.connectors.value].value) == 2
+            assert int(srv_cp._metrics[0][cdet.connectors].value) == 2
         finally:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -3048,7 +3292,7 @@ async def test_trigger_status_timeout_on_nonzero_adjusts_and_stops(
             await wait_ready(cs.charge_points[cp_id])
 
             srv_cp = cs.charge_points[cp_id]
-            srv_cp._metrics[0][cdet.connectors.value].value = 2
+            srv_cp._metrics[0][cdet.connectors].value = 2
 
             async def fake_call(req):
                 if isinstance(req, call.TriggerMessage):
@@ -3064,7 +3308,7 @@ async def test_trigger_status_timeout_on_nonzero_adjusts_and_stops(
             assert ok is False
             # Should stop after the failing connector
             assert attempts == [0, 1, 2]
-            assert int(srv_cp._metrics[0][cdet.connectors.value].value) == 1
+            assert int(srv_cp._metrics[0][cdet.connectors].value) == 1
         finally:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -3115,6 +3359,59 @@ async def test_post_connect_fetch_supported_features_raises(
             await srv_cp.post_connect()
 
             assert getattr(srv_cp, "post_connect_success", False) is not True
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            await ws.close()
+
+
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize(
+    "setup_config_entry",
+    [{"port": 9122, "cp_id": "CP_postconn_timeout", "cms": "cms_postconn_timeout"}],
+    indirect=True,
+)
+@pytest.mark.parametrize("cp_id", ["CP_postconn_timeout"])
+@pytest.mark.parametrize("port", [9122])
+async def test_post_connect_defaults_to_core_after_feature_profile_timeout(
+    hass, socket_enabled, cp_id, port, setup_config_entry, monkeypatch
+):
+    """A stalled optional feature query must not abort charger setup."""
+    cs: CentralSystem = setup_config_entry
+    original_call = ServerCP.call
+
+    async def timeout_feature_profiles(self, req):
+        if isinstance(req, call.GetConfiguration) and req.key == [
+            ckey.supported_feature_profiles
+        ]:
+            raise TimeoutError("no SupportedFeatureProfiles response")
+        return await original_call(self, req)
+
+    monkeypatch.setattr(ServerCP, "call", timeout_feature_profiles, raising=True)
+
+    async with websockets.connect(
+        f"ws://127.0.0.1:{port}/{cp_id}", subprotocols=["ocpp1.6"]
+    ) as ws:
+        from tests.test_charge_point_v16 import ChargePoint
+
+        client = ChargePoint(f"{cp_id}_client", ws)
+        task = asyncio.create_task(client.start())
+        try:
+            for _ in range(100):
+                if cp_id in cs.charge_points:
+                    break
+                await asyncio.sleep(0.02)
+            srv_cp = cs.charge_points[cp_id]
+
+            await srv_cp.post_connect()
+
+            assert srv_cp.post_connect_success is True
+            expected_features = prof.CORE
+            if srv_cp.settings.force_smart_charging:
+                expected_features |= prof.SMART
+            assert srv_cp._attr_supported_features == expected_features
+            assert srv_cp.num_connectors > 0
         finally:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -3549,7 +3846,8 @@ async def test_post_connect_set_standard_configuration_raises_outer_caught(
             srv_cp = cs.charge_points[cp_id]
 
             await srv_cp.post_connect()
-            assert getattr(srv_cp, "post_connect_success", False) is not True
+            # BG Sync fork: a failing set_standard_configuration is non-fatal.
+            assert getattr(srv_cp, "post_connect_success", False) is True
         finally:
             task.cancel()
 
@@ -3903,6 +4201,458 @@ async def test_eair_monotonic_increments_single_connector(
 @pytest.mark.timeout(10)
 @pytest.mark.parametrize(
     "setup_config_entry",
+    [{"port": 9398, "cp_id": "CP_eair_session_relative", "cms": "cms_services"}],
+    indirect=True,
+)
+@pytest.mark.parametrize("cp_id", ["CP_eair_session_relative"])
+@pytest.mark.parametrize("port", [9398])
+async def test_eair_session_relative_against_lifetime_meter_start(
+    hass, socket_enabled, cp_id, port, setup_config_entry
+):
+    """Session energy must never go negative when EAIR is session-relative.
+
+    Some chargers report a LIFETIME register in StartTransaction but
+    SESSION-relative energy in the MeterValues that follow. The
+    ``meter_start == 0`` detection never fires for them, so the else-branch
+    derives ``session = EAIR - meter_start`` and produces a large negative
+    value on a ``total_increasing`` sensor.
+
+    Once a tx-bound sample lands below ``meter_start`` the charger cannot be
+    reporting a lifetime register, so we switch to session-energy mode and use
+    the sample as-is.
+    """
+    cs = setup_config_entry
+    async with websockets.connect(
+        f"ws://127.0.0.1:{port}/{cp_id}", subprotocols=["ocpp1.6"]
+    ) as ws:
+        client = ChargePoint(f"{cp_id}_client", ws)
+        task = asyncio.create_task(client.start())
+        try:
+            await client.send_boot_notification()
+            await wait_ready(cs.charge_points[cp_id])
+            srv = cs.charge_points[cp_id]
+            cpid = srv.settings.cpid
+
+            # StartTransaction reports the LIFETIME register: 4076447 Wh.
+            await client.send_start_transaction(meter_start=4076447)
+            txid = client.active_transactionId
+
+            # First in-transaction sample is SESSION-relative: 113 Wh.
+            # Naively this derives 0.113 - 4076.447 = -4076.334 kWh.
+            mv1 = call.MeterValues(
+                connector_id=1,
+                transaction_id=txid,
+                meter_value=[
+                    {
+                        "timestamp": datetime.now(tz=UTC).isoformat(),
+                        "sampledValue": [
+                            {
+                                "value": "113",
+                                "measurand": "Energy.Active.Import.Register",
+                                "unit": "Wh",
+                                "context": "Sample.Periodic",
+                            }
+                        ],
+                    }
+                ],
+            )
+            assert await client.call(mv1) is not None
+            s1 = cs.get_metric(cpid, "Energy.Session", connector_id=1)
+            assert s1 is not None
+            assert s1 >= 0, f"session energy went negative: {s1}"
+            assert s1 == pytest.approx(0.113, rel=1e-6)
+
+            # The session-relative sample must NOT land on the lifetime
+            # register metric. (Read only after the fact: _metrics is a
+            # defaultdict, so reading a key beforehand creates it and changes
+            # the behaviour under test.)
+            eair = cs.get_metric(cpid, "Energy.Active.Import.Register", connector_id=1)
+            assert eair != pytest.approx(0.113, rel=1e-6), (
+                f"lifetime register was overwritten with the session value: {eair}"
+            )
+
+            # Subsequent samples keep tracking the session, still positive.
+            mv2 = call.MeterValues(
+                connector_id=1,
+                transaction_id=txid,
+                meter_value=[
+                    {
+                        "timestamp": datetime.now(tz=UTC).isoformat(),
+                        "sampledValue": [
+                            {
+                                "value": "236",
+                                "measurand": "Energy.Active.Import.Register",
+                                "unit": "Wh",
+                                "context": "Sample.Periodic",
+                            }
+                        ],
+                    }
+                ],
+            )
+            assert await client.call(mv2) is not None
+            s2 = cs.get_metric(cpid, "Energy.Session", connector_id=1)
+            assert s2 >= 0, f"session energy went negative: {s2}"
+            assert s2 == pytest.approx(0.236, rel=1e-6)
+            assert s2 >= s1
+
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            await ws.close()
+
+
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize(
+    "setup_config_entry",
+    [{"port": 9418, "cp_id": "CP_eair_quantized", "cms": "cms_services"}],
+    indirect=True,
+)
+@pytest.mark.parametrize("cp_id", ["CP_eair_quantized"])
+@pytest.mark.parametrize("port", [9418])
+async def test_eair_quantization_below_meter_start(
+    hass, socket_enabled, cp_id, port, setup_config_entry
+):
+    """Quantized lifetime readings keep session energy nonnegative and derived."""
+    cs = setup_config_entry
+    async with websockets.connect(
+        f"ws://127.0.0.1:{port}/{cp_id}", subprotocols=["ocpp1.6"]
+    ) as ws:
+        client = ChargePoint(f"{cp_id}_client", ws)
+        task = asyncio.create_task(client.start())
+        try:
+            await client.send_boot_notification()
+            await wait_ready(cs.charge_points[cp_id])
+            srv = cs.charge_points[cp_id]
+            cpid = srv.settings.cpid
+            await client.send_start_transaction(meter_start=788591)
+            txid = client.active_transactionId
+
+            for value, expected_session in [("788.59", 0.0), ("789.59", 0.999)]:
+                mv = call.MeterValues(
+                    connector_id=1,
+                    transaction_id=txid,
+                    meter_value=[
+                        {
+                            "timestamp": datetime.now(tz=UTC).isoformat(),
+                            "sampledValue": [
+                                {
+                                    "value": value,
+                                    "measurand": "Energy.Active.Import.Register",
+                                    "unit": "kWh",
+                                    "context": "Sample.Periodic",
+                                }
+                            ],
+                        }
+                    ],
+                )
+                assert await client.call(mv) is not None
+                assert cs.get_metric(
+                    cpid, "Energy.Session", connector_id=1
+                ) == pytest.approx(expected_session)
+                assert cs.get_metric(
+                    cpid, "Energy.Active.Import.Register", connector_id=1
+                ) == pytest.approx(float(value))
+                assert not srv._charger_reports_session_energy
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            await ws.close()
+
+
+def _eair_sample(connector_id: int, transaction_id: int, wh: int) -> call.MeterValues:
+    """Build a transaction-bound Energy.Active.Import.Register sample in Wh."""
+    return call.MeterValues(
+        connector_id=connector_id,
+        transaction_id=transaction_id,
+        meter_value=[
+            {
+                "timestamp": datetime.now(tz=UTC).isoformat(),
+                "sampledValue": [
+                    {
+                        "value": str(wh),
+                        "measurand": "Energy.Active.Import.Register",
+                        "unit": "Wh",
+                        "context": "Sample.Periodic",
+                    }
+                ],
+            }
+        ],
+    )
+
+
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize(
+    "setup_config_entry",
+    [{"port": 9399, "cp_id": "CP_session_mode_per_tx", "cms": "cms_services"}],
+    indirect=True,
+)
+@pytest.mark.parametrize("cp_id", ["CP_session_mode_per_tx"])
+@pytest.mark.parametrize("port", [9399])
+async def test_session_energy_mode_does_not_outlive_its_transaction(
+    hass, socket_enabled, cp_id, port, setup_config_entry
+):
+    """A session-energy detection must not decide how the next session is read.
+
+    The charger reports a lifetime register. One sample below meter_start
+    switches the charger to session-energy mode for that transaction. The
+    next transaction is a normal lifetime reading, so its session energy is
+    EAIR - meter_start, not the raw register (#2143).
+    """
+    cs = setup_config_entry
+    async with websockets.connect(
+        f"ws://127.0.0.1:{port}/{cp_id}", subprotocols=["ocpp1.6"]
+    ) as ws:
+        client = ChargePoint(f"{cp_id}_client", ws)
+        task = asyncio.create_task(client.start())
+        try:
+            await client.send_boot_notification()
+            await wait_ready(cs.charge_points[cp_id])
+            cpid = cs.charge_points[cp_id].settings.cpid
+
+            await client.send_start_transaction(meter_start=356000)
+            tx1 = client.active_transactionId
+            assert await client.call(_eair_sample(1, tx1, 8620)) is not None
+            # The sample below meter_start was taken as session energy.
+            s1 = cs.get_metric(cpid, "Energy.Session", connector_id=1)
+            assert s1 == pytest.approx(8.62, rel=1e-6)
+            await client.send_stop_transaction(0)
+
+            await client.send_start_transaction(meter_start=356040)
+            tx2 = client.active_transactionId
+            assert await client.call(_eair_sample(1, tx2, 357040)) is not None
+            s2 = cs.get_metric(cpid, "Energy.Session", connector_id=1)
+            assert s2 == pytest.approx(1.0, rel=1e-6), (
+                f"session energy is the raw register, not EAIR - meter_start: {s2}"
+            )
+            eair = cs.get_metric(cpid, "Energy.Active.Import.Register", connector_id=1)
+            assert eair == pytest.approx(357.04, rel=1e-6)
+
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            await ws.close()
+
+
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize(
+    "setup_config_entry",
+    [{"port": 9400, "cp_id": "CP_session_mode_two_conn", "cms": "cms_services"}],
+    indirect=True,
+)
+@pytest.mark.parametrize("cp_id", ["CP_session_mode_two_conn"])
+@pytest.mark.parametrize("port", [9400])
+async def test_session_energy_mode_kept_while_another_connector_runs(
+    hass, socket_enabled, cp_id, port, setup_config_entry
+):
+    """A new transaction keeps the mode while another connector charges.
+
+    The charger reports session energy in MeterValues against a lifetime
+    meterStart. Connector 1's first sample is below its meter_start, which
+    detects the mode. A StartTransaction on connector 2 while connector 1 is
+    still charging must not clear it, or connector 1's next sample, now above
+    its meter_start, would be derived as EAIR - meter_start.
+    """
+    cs = setup_config_entry
+    async with websockets.connect(
+        f"ws://127.0.0.1:{port}/{cp_id}", subprotocols=["ocpp1.6"]
+    ) as ws:
+        client = ChargePoint(f"{cp_id}_client", ws, no_connectors=2)
+        task = asyncio.create_task(client.start())
+        try:
+            await client.send_boot_notification()
+            await wait_ready(cs.charge_points[cp_id])
+            cpid = cs.charge_points[cp_id].settings.cpid
+
+            async def start(connector_id: int, meter_start: int) -> int:
+                resp = await client.call(
+                    call.StartTransaction(
+                        connector_id=connector_id,
+                        id_tag="test_cp",
+                        meter_start=meter_start,
+                        timestamp=datetime.now(tz=UTC).isoformat(),
+                    )
+                )
+                return resp.transaction_id
+
+            def session(connector_id: int) -> float:
+                return cs.get_metric(cpid, "Energy.Session", connector_id=connector_id)
+
+            tx1 = await start(1, 5000)
+            assert await client.call(_eair_sample(1, tx1, 4900)) is not None
+            assert session(1) == pytest.approx(4.9, rel=1e-6)
+
+            tx2 = await start(2, 20000)
+            assert await client.call(_eair_sample(1, tx1, 5100)) is not None
+            assert session(1) == pytest.approx(5.1, rel=1e-6), (
+                f"connector 1 lost the mode when connector 2 started: {session(1)}"
+            )
+            assert await client.call(_eair_sample(2, tx2, 21000)) is not None
+            assert session(2) == pytest.approx(21.0, rel=1e-6)
+
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            await ws.close()
+
+
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize(
+    "setup_config_entry",
+    [{"port": 9401, "cp_id": "CP_session_mode_main_meter", "cms": "cms_services"}],
+    indirect=True,
+)
+@pytest.mark.parametrize("cp_id", ["CP_session_mode_main_meter"])
+@pytest.mark.parametrize("port", [9401])
+async def test_session_energy_mode_not_held_by_the_main_meter(
+    hass, socket_enabled, cp_id, port, setup_config_entry
+):
+    """MeterValues for connector 0 must not keep the mode alive.
+
+    Connector 0 is the charger's main meter. Before #2170, a sample for it
+    also restored connector 1's transaction id onto connector 0, and the
+    send_stop_transaction below was held as ambiguous instead of applied;
+    since #2170 it is applied. Either way this test is only about the mode:
+    tx2's StartTransaction still clears it.
+    """
+    cs = setup_config_entry
+    async with websockets.connect(
+        f"ws://127.0.0.1:{port}/{cp_id}", subprotocols=["ocpp1.6"]
+    ) as ws:
+        client = ChargePoint(f"{cp_id}_client", ws)
+        task = asyncio.create_task(client.start())
+        try:
+            await client.send_boot_notification()
+            await wait_ready(cs.charge_points[cp_id])
+            cpid = cs.charge_points[cp_id].settings.cpid
+
+            await client.send_start_transaction(meter_start=356000)
+            tx1 = client.active_transactionId
+            assert await client.call(_eair_sample(1, tx1, 8620)) is not None
+            await hass.async_block_till_done()
+            main_meter = call.MeterValues(
+                connector_id=0,
+                meter_value=[
+                    {
+                        "timestamp": datetime.now(tz=UTC).isoformat(),
+                        "sampledValue": [
+                            {
+                                "value": "1000",
+                                "measurand": "Power.Active.Import",
+                                "unit": "W",
+                                "context": "Sample.Periodic",
+                            }
+                        ],
+                    }
+                ],
+            )
+            assert await client.call(main_meter) is not None
+            await client.send_stop_transaction(0)
+
+            await client.send_start_transaction(meter_start=356040)
+            tx2 = client.active_transactionId
+            assert await client.call(_eair_sample(1, tx2, 357040)) is not None
+            s2 = cs.get_metric(cpid, "Energy.Session", connector_id=1)
+            assert s2 == pytest.approx(1.0, rel=1e-6), (
+                f"session energy is the raw register, not EAIR - meter_start: {s2}"
+            )
+
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            await ws.close()
+
+
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize(
+    ("setup_config_entry", "cp_id", "port", "sample_wh", "meter_stop", "session"),
+    [
+        # No MeterValues; the stop is far below a lifetime meter_start.
+        (
+            {"port": 9402, "cp_id": "CP_stop_below_start_a", "cms": "cms_services"},
+            "CP_stop_below_start_a",
+            9402,
+            None,
+            153,
+            0.0,
+        ),
+        # A sample 1 Wh above meter_start, then a stop 1 Wh below meter_start.
+        (
+            {"port": 9403, "cp_id": "CP_stop_below_start_b", "cms": "cms_services"},
+            "CP_stop_below_start_b",
+            9403,
+            356001,
+            355999,
+            0.001,
+        ),
+    ],
+    indirect=["setup_config_entry"],
+)
+async def test_stop_below_meter_start_does_not_publish_a_negative(
+    hass,
+    socket_enabled,
+    cp_id,
+    port,
+    setup_config_entry,
+    sample_wh,
+    meter_stop,
+    session,
+):
+    """A meter_stop below meter_start keeps the session value already derived.
+
+    Such a stop can't be told apart from a session-relative meter, a meter
+    replacement, a reset or a rollover. Deriving meter_stop - meter_start
+    would publish a negative on a total_increasing sensor, and taking the
+    stop as the session would publish the raw register, so neither is done.
+    """
+    cs = setup_config_entry
+    async with websockets.connect(
+        f"ws://127.0.0.1:{port}/{cp_id}", subprotocols=["ocpp1.6"]
+    ) as ws:
+        client = ChargePoint(f"{cp_id}_client", ws)
+        task = asyncio.create_task(client.start())
+        try:
+            await client.send_boot_notification()
+            await wait_ready(cs.charge_points[cp_id])
+            cpid = cs.charge_points[cp_id].settings.cpid
+
+            meter_start = 4076447 if sample_wh is None else 356000
+            await client.send_start_transaction(meter_start=meter_start)
+            txid = client.active_transactionId
+            if sample_wh is not None:
+                assert await client.call(_eair_sample(1, txid, sample_wh)) is not None
+            before = cs.get_metric(cpid, "Energy.Session", connector_id=1)
+            assert before == pytest.approx(session, abs=1e-9)
+
+            await client.call(
+                call.StopTransaction(
+                    meter_stop=meter_stop,
+                    timestamp=datetime.now(tz=UTC).isoformat(),
+                    transaction_id=txid,
+                    reason="EVDisconnected",
+                    id_tag="test_cp",
+                )
+            )
+            s = cs.get_metric(cpid, "Energy.Session", connector_id=1)
+            assert s >= 0, f"session energy went negative: {s}"
+            assert s == pytest.approx(session, abs=1e-9), (
+                f"session energy was not kept at {session}: {s}"
+            )
+
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            await ws.close()
+
+
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize(
+    "setup_config_entry",
     [{"port": 9351, "cp_id": "CP_set_rate_active_tx", "cms": "cms_services"}],
     indirect=True,
 )
@@ -3929,10 +4679,10 @@ async def test_set_charge_rate_with_active_transaction(
             # Mock get_configuration so set_charge_rate doesn't hit srv.call for these
             async def fake_get_configuration(key: str = "") -> str:
                 # units: pretend charger supports Amps
-                if key == ckey.charging_schedule_allowed_charging_rate_unit.value:
+                if key == ckey.charging_schedule_allowed_charging_rate_unit:
                     return "A"  # same as om.current.value
                 # stack level
-                if key == ckey.charge_profile_max_stack_level.value:
+                if key == ckey.charge_profile_max_stack_level:
                     return "2"
                 return ""
 
@@ -4013,9 +4763,9 @@ async def test_set_charge_rate_exception_paths(
             srv._attr_supported_features = {prof.SMART}
 
             async def fake_get_configuration(key: str = "") -> str:
-                if key == ckey.charging_schedule_allowed_charging_rate_unit.value:
+                if key == ckey.charging_schedule_allowed_charging_rate_unit:
                     return "A"
-                if key == ckey.charge_profile_max_stack_level.value:
+                if key == ckey.charge_profile_max_stack_level:
                     return "2"
                 return ""
 
@@ -4297,7 +5047,7 @@ async def test_on_meter_values_exception_branches_are_handled(
             conn = 1
 
             # 1) Install a Metric subclass that trips the first int(...) then returns 0
-            tx_key = (conn, csess.transaction_id.value)
+            tx_key = (conn, csess.transaction_id)
             with contextlib.suppress(Exception):
                 del srv._active_tx[conn]
             srv._metrics[tx_key] = FlakyTxMetric()
@@ -4379,7 +5129,7 @@ async def test_on_meter_values_exception_branches_with_restore(
 
             with contextlib.suppress(Exception):
                 del srv._active_tx[conn]
-            srv._metrics[(conn, csess.transaction_id.value)] = FlakyTxMetric()
+            srv._metrics[(conn, csess.transaction_id)] = FlakyTxMetric()
             srv.num_connectors = BadInt()
             srv.active_transaction_id = BadInt()
 
@@ -4481,7 +5231,7 @@ async def test_change_availability_conn0_rejected_falls_back_to_conn1(
             assert conn_ids[:2] == [0, 1], f"Unexpected call order/targets: {conn_ids}"
 
             # Optionally assert that no pending marker was set for this Accepted outcome
-            m = srv._metrics.get((1, cstat.status_connector.value))
+            m = srv._metrics.get((1, cstat.status_connector))
             if m is not None:
                 assert "availability_pending" not in getattr(m, "extra_attr", {})
 
@@ -4905,7 +5655,7 @@ class ChargePoint(cpclass):
     @on(Action.get_configuration)
     def on_get_configuration(self, key, **kwargs):
         """Handle a get configuration requests."""
-        if key[0] == ckey.supported_feature_profiles.value:
+        if key[0] == ckey.supported_feature_profiles:
             if self.accept is True:
                 return call_result.GetConfiguration(
                     configuration_key=[
@@ -4919,17 +5669,17 @@ class ChargePoint(cpclass):
             else:
                 # use to test TypeError handling
                 return call_result.GetConfiguration(unknown_key=[key[0]])
-        if key[0] == ckey.heartbeat_interval.value:
+        if key[0] == ckey.heartbeat_interval:
             return call_result.GetConfiguration(
                 configuration_key=[{"key": key[0], "readonly": False, "value": "300"}]
             )
-        if key[0] == ckey.number_of_connectors.value:
+        if key[0] == ckey.number_of_connectors:
             return call_result.GetConfiguration(
                 configuration_key=[
                     {"key": key[0], "readonly": False, "value": f"{self.no_connectors}"}
                 ]
             )
-        if key[0] == ckey.web_socket_ping_interval.value:
+        if key[0] == ckey.web_socket_ping_interval:
             if self.accept is True:
                 return call_result.GetConfiguration(
                     configuration_key=[
@@ -4938,7 +5688,7 @@ class ChargePoint(cpclass):
                 )
             else:
                 return call_result.GetConfiguration(unknown_key=[key[0]])
-        if key[0] == ckey.meter_values_sampled_data.value:
+        if key[0] == ckey.meter_values_sampled_data:
             if self.accept is True:
                 return call_result.GetConfiguration(
                     configuration_key=[
@@ -4951,7 +5701,7 @@ class ChargePoint(cpclass):
                 )
             else:
                 pass
-        if key[0] == ckey.meter_value_sample_interval.value:
+        if key[0] == ckey.meter_value_sample_interval:
             if self.accept is True:
                 return call_result.GetConfiguration(
                     configuration_key=[
@@ -4962,7 +5712,7 @@ class ChargePoint(cpclass):
                 return call_result.GetConfiguration(
                     configuration_key=[{"key": key[0], "readonly": True, "value": "60"}]
                 )
-        if key[0] == ckey.charging_schedule_allowed_charging_rate_unit.value:
+        if key[0] == ckey.charging_schedule_allowed_charging_rate_unit:
             if self.accept is True:
                 return call_result.GetConfiguration(
                     configuration_key=[
@@ -4971,7 +5721,7 @@ class ChargePoint(cpclass):
                 )
             else:
                 return call_result.GetConfiguration(unknown_key=[key[0]])
-        if key[0] == ckey.authorize_remote_tx_requests.value:
+        if key[0] == ckey.authorize_remote_tx_requests:
             if self.accept is True:
                 return call_result.GetConfiguration(
                     configuration_key=[
@@ -4980,7 +5730,7 @@ class ChargePoint(cpclass):
                 )
             else:
                 return call_result.GetConfiguration(unknown_key=[key[0]])
-        if key[0] == ckey.charge_profile_max_stack_level.value:
+        if key[0] == ckey.charge_profile_max_stack_level:
             return call_result.GetConfiguration(
                 configuration_key=[{"key": key[0], "readonly": False, "value": "3"}]
             )
@@ -4992,7 +5742,7 @@ class ChargePoint(cpclass):
     def on_change_configuration(self, key, **kwargs):
         """Handle a get configuration request."""
         if self.accept is True:
-            if key == ckey.meter_values_sampled_data.value:
+            if key == ckey.meter_values_sampled_data:
                 return call_result.ChangeConfiguration(
                     ConfigurationStatus.reboot_required
                 )

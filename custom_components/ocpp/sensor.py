@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
+
 import homeassistant
 from homeassistant.components.sensor import (
     DOMAIN as SENSOR_DOMAIN,
@@ -12,9 +14,9 @@ from homeassistant.components.sensor import (
     SensorEntityDescription,
     SensorStateClass,
 )
-from homeassistant.const import CONF_MONITORED_VARIABLES
+from homeassistant.const import CONF_MONITORED_VARIABLES, UnitOfTime
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.util import slugify
@@ -30,6 +32,7 @@ from .const import (
     DOMAIN,
     ICON,
     Measurand,
+    sensor_unique_id,
 )
 from .enums import HAChargerDetails, HAChargerSession, HAChargerStatuses
 
@@ -100,6 +103,7 @@ DISABLED_BY_DEFAULT_METRICS = {
     "power.offered",
     "rpm",
 }
+_LOGGER: logging.Logger = logging.getLogger(__package__)
 
 
 @dataclass
@@ -119,6 +123,10 @@ async def async_setup_entry(hass, entry, async_add_devices):
     for charger in entry.data[CONF_CPIDS]:
         cp_id_settings = list(charger.values())[0]
         cpid = cp_id_settings[CONF_CPID]
+
+        charger_device_id = dr.async_get_device_id_by_identifier(
+            hass, (DOMAIN, cpid), config_entry_id=entry.entry_id
+        )
 
         num_connectors = 1
         for item in entry.data.get(CONF_CPIDS, []):
@@ -195,25 +203,32 @@ async def async_setup_entry(hass, entry, async_add_devices):
         def _uid(cpid: str, key: str, connector_id: int | None) -> str:
             """Mirror ChargePointMetric unique_id construction.
 
-            BG Sync fork: upstream lowercases without replacing dots, so this
-            lookup never matched any dotted metric (Status.Connector and
-            friends) and the stale-entity cleanup below silently did nothing.
-            Upstream fixes this properly in v0.10.19b0 by single-sourcing the
-            format as const.sensor_unique_id(); when this fork rebases past
-            v0.10.18, delete this helper and delegate to that instead.
+            Delegates to the canonical helper. The previous local copy
+            lowercased without replacing dots, so the stale-entity cleanup
+            below never matched any dotted metric (Status.Connector and
+            friends) - single-sourcing the format is what fixes that.
             """
-            key = key.lower().replace(".", "_")
-            parts = [DOMAIN, cpid, key, SENSOR_DOMAIN]
-            if connector_id is not None:
-                parts.insert(2, f"conn{connector_id}")
-            return ".".join(parts)
+            return sensor_unique_id(cpid, key, connector_id)
 
         if num_connectors > 1:
             for metric in CONNECTOR_ONLY:
                 uid = _uid(cpid, metric, connector_id=None)
                 stale_eid = ent_reg.async_get_entity_id(SENSOR_DOMAIN, DOMAIN, uid)
                 if stale_eid:
-                    # Remove the old entity so it doesn't linger as 'unavailable'
+                    # Remove the old entity so it doesn't linger as
+                    # 'unavailable': with more than one connector these
+                    # metrics exist per-connector only, so the flat variant
+                    # is a genuine orphan. Removal destroys any rename or
+                    # customisation with it, so say what happened - for
+                    # dotted metrics this lookup never matched before the
+                    # unique_id format was single-sourced, meaning upgrades
+                    # can hit this for the first time long after setup.
+                    _LOGGER.info(
+                        "Removing stale charger-level entity %s; "
+                        "%s is per-connector on this charger",
+                        stale_eid,
+                        metric,
+                    )
                     ent_reg.async_remove(stale_eid)
         else:
             # Clear out entities registered enabled before these metrics were
@@ -239,6 +254,7 @@ async def async_setup_entry(hass, entry, async_add_devices):
                     cpid,
                     _mk_desc(metric, cat_diag=True),
                     connector_id=None,
+                    charger_device_id=charger_device_id,
                 )
             )
 
@@ -254,11 +270,12 @@ async def async_setup_entry(hass, entry, async_add_devices):
                                 metric,
                                 cat_diag=metric
                                 in [
-                                    HAChargerStatuses.status_connector.value,
-                                    HAChargerStatuses.error_code_connector.value,
+                                    HAChargerStatuses.status_connector,
+                                    HAChargerStatuses.error_code_connector,
                                 ],
                             ),
                             connector_id=conn_id,
+                            charger_device_id=charger_device_id,
                         )
                     )
         else:
@@ -272,11 +289,12 @@ async def async_setup_entry(hass, entry, async_add_devices):
                             metric,
                             cat_diag=metric
                             in [
-                                HAChargerStatuses.status_connector.value,
-                                HAChargerStatuses.error_code_connector.value,
+                                HAChargerStatuses.status_connector,
+                                HAChargerStatuses.error_code_connector,
                             ],
                         ),
                         connector_id=None,
+                        charger_device_id=charger_device_id,
                     )
                 )
 
@@ -296,6 +314,7 @@ class ChargePointMetric(RestoreSensor, SensorEntity):
         cpid: str,
         description: OcppSensorDescription,
         connector_id: int | None = None,
+        charger_device_id: str | None = None,
     ):
         """Instantiate instance of a ChargePointMetrics."""
         self.central_system = central_system
@@ -306,17 +325,20 @@ class ChargePointMetric(RestoreSensor, SensorEntity):
         self._hass = hass
         self._extra_attr = {}
         self._last_reset = homeassistant.util.dt.utc_from_timestamp(0)
-        parts = [DOMAIN, self.cpid, self.entity_description.key, SENSOR_DOMAIN]
-        if self.connector_id is not None:
-            parts.insert(2, f"conn{self.connector_id}")
-        self._attr_unique_id = ".".join(parts)
+        self._attr_unique_id = sensor_unique_id(
+            self.cpid, self.entity_description.metric, self.connector_id
+        )
         self._attr_name = self.entity_description.name
         if self.connector_id is not None:
-            self._attr_device_info = DeviceInfo(
-                identifiers={(DOMAIN, f"{cpid}-conn{self.connector_id}")},
-                name=f"{cpid} Connector {self.connector_id}",
-                via_device=(DOMAIN, cpid),
-            )
+            device_info: DeviceInfo = {
+                "identifiers": {(DOMAIN, f"{cpid}-conn{self.connector_id}")},
+                "name": f"{cpid} Connector {self.connector_id}",
+            }
+            if charger_device_id is not None:
+                device_info["via_device_id"] = charger_device_id
+            else:
+                device_info["via_device"] = (DOMAIN, cpid)
+            self._attr_device_info = DeviceInfo(**device_info)
         else:
             self._attr_device_info = DeviceInfo(
                 identifiers={(DOMAIN, cpid)},
@@ -366,9 +388,9 @@ class ChargePointMetric(RestoreSensor, SensorEntity):
             SensorDeviceClass.BATTERY,
             SensorDeviceClass.FREQUENCY,
         ] or self.metric in [
-            HAChargerStatuses.latency_ping.value,
-            HAChargerStatuses.latency_pong.value,
-            HAChargerSession.session_time.value,
+            HAChargerStatuses.latency_ping,
+            HAChargerStatuses.latency_pong,
+            HAChargerSession.session_time,
         ]:
             state_class = SensorStateClass.MEASUREMENT
 
@@ -398,9 +420,9 @@ class ChargePointMetric(RestoreSensor, SensorEntity):
         elif self.metric.lower().startswith("temperature"):
             device_class = SensorDeviceClass.TEMPERATURE
         elif self.metric.lower().startswith("timestamp") or self.metric in [
-            HAChargerDetails.config_response.value,
-            HAChargerDetails.data_response.value,
-            HAChargerStatuses.heartbeat.value,
+            HAChargerDetails.config_response,
+            HAChargerDetails.data_response,
+            HAChargerStatuses.heartbeat,
         ]:
             device_class = SensorDeviceClass.TIMESTAMP
         elif self.metric.lower().startswith("soc"):
@@ -415,7 +437,7 @@ class ChargePointMetric(RestoreSensor, SensorEntity):
         )
 
         # Special case for features - show profiles as labels from IntFlag
-        if self.metric == HAChargerDetails.features.value and value is not None:
+        if self.metric == HAChargerDetails.features and value is not None:
             if hasattr(value, "labels"):
                 self._attr_native_value = value.labels()
             else:
@@ -430,6 +452,11 @@ class ChargePointMetric(RestoreSensor, SensorEntity):
     @property
     def native_unit_of_measurement(self):
         """Return the native unit of measurement."""
+        # Session duration is calculated in minutes by both protocol handlers.
+        # Keep its unit even before connection or when restoring offline state.
+        if self.metric == HAChargerSession.session_time:
+            return UnitOfTime.MINUTES
+
         value = self.central_system.get_ha_unit(
             self.cpid, self.metric, self.connector_id
         )

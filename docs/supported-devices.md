@@ -3,6 +3,8 @@ Supported devices
 
 All OCPP 1.6j compatible devices should be supported, but not every device offers the same level of functionality. So far, we've tried:
 
+Running several of these at once? See [Multiple central systems](https://github.com/lbbrhzn/ocpp/blob/main/docs/multiple-central-systems.md) for how actions are routed when more than one central system is configured.
+
 ## ABB Terra AC chargers
 
 ABB Terra AC chargers with firmware version 1.8.21 and earlier fail to respond correctly when OCPP measurands are automatically detected by the OCPP integration. As of this writing, ABB has been notified, but no corresponding firmware fix is available.
@@ -38,6 +40,10 @@ To use these chargers:
 
 This list is based on the overview of OCPP 1.6 implementation for ABB Terra AC (firmware 1.6.6).
 
+### Charging profiles rejected at the reported stack level
+
+The charger rejects charging profiles at the `ChargeProfileMaxStackLevel` it reports ([Issue #1737](https://github.com/lbbrhzn/ocpp/issues/1737)). Enable **Charger accepts only stack levels below its reported maximum** in the charger options (see [Charging profile stack level](Charge_automation.md#charging-profile-stack-level)).
+
 ### [ABB Terra AC-W7-G5-R-0](https://new.abb.com/products/6AGC082156/tac-w7-g5-r-0)
 
 ### [ABB Terra AC-W11-G5-R-0](https://new.abb.com/products/6AGC082156/tac-w11-g5-r-0)
@@ -49,6 +55,43 @@ This list is based on the overview of OCPP 1.6 implementation for ABB Terra AC (
 ## [Alfen - Eve Single Pro-line](https://alfen.com/en/ev-charge-points/alfen-product-range)
 
 ## [Alfen - Eve Single S-line](https://alfen.com/en/ev-charge-points/alfen-product-range)
+
+## [Autel MaxiCharger](https://autelenergy.us/pages/residential)
+The MaxiCharger works with the OCPP integration, but the community has run into a few quirks - see [Issue #1523](https://github.com/lbbrhzn/ocpp/issues/1523) for the full discussion.
+
+Confirmed working on units reporting `MaxiChargerAC` as their model over `BootNotification` (vendor `Autel`, firmware `PFA0102|V0.00.00|V1.38.00||2.4.3.0`), speaking OCPP 1.6-J. Worth stating explicitly because Autel support has told at least one owner that their unit does not support OCPP and that only the AC Smart Elite does; that is not the case.
+
+On a local network no TLS setup is needed - a plain `ws://<home-assistant-ip>:9000` server URL in the charger's OCPP settings is enough. The section below applies only if you are terminating TLS with a reverse proxy.
+
+### Station-wide maximum current (`number.<cpid>_maximum_current`) is rejected
+
+The MaxiCharger rejects the `ChargePointMaxProfile` that the integration normally sends to enforce a whole-station charging ceiling (e.g. from `number.<cpid>_maximum_current` or the `set_charge_rate` service without a connector) because that profile is `Relative` by default, and Autel's firmware does not honour a relative schedule there - see [Issue #1565](https://github.com/lbbrhzn/ocpp/issues/1565).
+
+Enable **Send the station charging limit as an absolute schedule** in the charge point's options (Settings -> Devices & Services -> OCPP -> configure the charger) to work around this. It makes the integration send that same profile as an `Absolute` schedule anchored at a fixed, arbitrary past timestamp instead, which the MaxiCharger accepts. Per-connector limits (`TxDefaultProfile`/`TxProfile`, used while a session is active) are unaffected either way.
+
+### Getting `wss://` (TLS) working behind a reverse proxy (e.g. Traefik)
+
+If you're terminating TLS with a reverse proxy such as Traefik (e.g. using Let's Encrypt), the "certificate" field in the Autel's OCPP server setup is required. The charger will silently drop the `wss://` connection if you do not provide a certificate file.
+
+You can either upload the self-generated certificate, or the root CA. An example for Let's Encrypt:
+
+1. Download the ISRG Root X1 certificate from https://letsencrypt.org/certs/isrgrootx1.pem
+2. Verify the chain validates against it before touching the charger:
+   ```bash
+   openssl s_client -connect your.ocpp.host:PORT \
+     -servername your.ocpp.host \
+     -CAfile isrg-root-x1.pem
+   ```
+   If you see `Verify return code: 0 (ok)`, uploading that certificate to the Autel will work.
+3. Upload the certificate to the Autel's OCPP server configuration (the "certificate" field), along with your `wss://` server URL.
+
+### Automation quirks
+
+When writing automations against the MaxiCharger:
+
+- Start/stop charging via `switch.<cpid>_charge_control`, not a remote-start service call.
+- If a session is stopped via `switch.<cpid>_charge_control` while the car stays plugged in (e.g. leaving an off-peak window), the connector sits in `Finishing` rather than going back to `Available`. It won't accept a new session on its own when charging should resume (e.g. the next off-peak window) - press `button.<cpid>_reset` to start a new session without unplugging the car.
+- Gate on `sensor.<cpid>_status_connector`, not `sensor.<cpid>_status`. The latter can read `Available` while a car is plugged in and simply not drawing current; the connector sensor reported `SuspendedEV` for the same charger at the same moment.
 
 ## [CTEK Chargestorm Connected 1, dual connectors](https://www.ctek.com/uk/ev-charging/chargestorm-connected-1)
 See CTEK Chargestorm Connected 2 below for getting started instructions.
@@ -102,7 +145,23 @@ match transactions and it won't report some meter values such as session time.
 ## [Evnex E Series & X Series Charging Stations](https://www.evnex.com/)
 (Ability to configure a custom OCPP server such as HA is being discontinued)
 
+## [FoxESS A-series](https://www.fox-ess.com/) (tested: A022KP1, firmware 1.10/1.06)
+
+Works well on OCPP 1.6J: remote start/stop, status, metering and the `Maximum Current` control all behave. The firmware's OCPP 2.0.1 support has several defects, all reproduced on the wire and confirmed by FoxESS support as protocol-level firmware defects, logged with their engineering team (no fix timeline yet). **Until fixed firmware ships, FoxESS's own guidance matches ours: run this charger on 1.6J.** On 2.0.1:
+
+* `Maximum Current` does not work. The firmware validates 2.0.1 requests against its 1.6 schema and rejects every spec-valid `SetChargingProfile` with `PropertyConstraintViolation: csChargingProfiles validation failed` (a 1.6 field name), so the slider has no effect on the charger.
+* Restarting a stopped charge can knock the charger offline. A `RequestStartTransaction` sent within a few minutes of a `RequestStopTransaction` is accepted and opens a transaction, but no power is ever offered to the vehicle (the charger reports `SuspendedEV`), and the charger then drops offline entirely. Automations that stop and later restart charging - tariff windows, state-of-charge limits - hit this path.
+* Only session energy is reported by default (`TxUpdatedMeasurands = Energy.Active.Import.Register`), so Power/Current/Voltage sensors stay unavailable unless additional measurands are configured on the charger itself.
+* `connectorStatus: Available` is reported after every transaction ends even with the cable still plugged in (on 1.6 the same firmware correctly reports `Finishing`/`Preparing`), so plug detection via the status sensor is unreliable.
+* If the charger's app is left on protocol *auto* while the integration pins 2.0.1, the firmware sends 1.6-shaped messages over the negotiated `ocpp2.0.1` connection.
+
+Reconnection (either protocol): the charger's OCPP client does not reliably redial after an established connection drops. After a Home Assistant restart or an integration reload, silent gaps of ~6 to 19+ minutes before the next connection attempt have been observed (occasionally it reconnects immediately), while a *refused* handshake - e.g. a protocol mismatch - is retried every ~10 seconds indefinitely. If the charger's entities stay unavailable after an HA restart, re-apply the protocol setting in the FoxESS app: that forces a reconnect within ~90 seconds.
+
 ## [Garo Entity Pro](https://www.garo.se/en/professional/products/e-mobility/wallbox/entity-pro/wallbox-entity-pro-22-sigi-o)
+
+## Huawei SCharger (FusionCharge)
+
+Power-only: the charger reports `ChargingScheduleAllowedChargingRateUnit` as `Power`, so the integration converts current limits to watts. A three-phase Huawei won't charge below about 4140 W, 6 A on each phase ([Issue #1810](https://github.com/lbbrhzn/ocpp/issues/1810)). On a three-phase model such as the SCharger-22KT, enable **Charger is fed three-phase** in the charger options, then set Maximum Current again. Otherwise a limit set before any per-phase meter values arrive, as after a restart, is converted for one phase, so a limit below 18 A goes out under 4140 W and the charger ends the session ([Issue #2224](https://github.com/lbbrhzn/ocpp/issues/2224)). With it on, every limit is converted for three phases, so a single-phase car can draw up to three times the current set. Unless the charger reports its voltage between phases, the conversion takes each phase as fed to neutral, so on a supply without neutral, such as a 230 V IT network, the charger can draw about 1.7 times the current set. Leave it off on the single-phase SCharger-7KS.
 
 ## [MaXpeedingrods Ev Charger](https://www.maxpeedingrods.com/category/ev-charger.html)
 
@@ -112,6 +171,16 @@ match transactions and it won't report some meter values such as session time.
 Successful connection requires firmware version **A0-MEV-V2.0.9** or newer.
 
 The "Charger idle sampling interval" is not supported. Set this to **0** to avoid a "ClockAlignedDataInterval is read-only" warning.
+
+The MEV11 (firmware A0-MEV-V2.1.8) reports `ChargeProfileMaxStackLevel` 5 but rejects charging profiles at level 5. Enable **Charger accepts only stack levels below its reported maximum** in the charger options (see [Charging profile stack level](Charge_automation.md#charging-profile-stack-level)).
+
+## [Ocular LTE Plus v3](https://evse.com.au/) (tested: reports as BS-EV22, firmware 448.3251.0Q03197)
+Works, with some firmware quirks worth knowing about. The same behaviour has been seen on the BS-EV07, so it likely applies to other chargers reporting the vendor `BS AC EV Charger`.
+
+- In the charger's app, set MODE to ONLINE and enter the address without a scheme, for example `192.168.1.10:9000/central`. The examples shown in the app do not work.
+- The charger sends its closing meter reading after StopTransaction rather than before. This is handled.
+- After a remote stop the connector stays in `Finishing` until the cable is unplugged, and it rejects a remote start while it is in that state. To pause and resume a charge without unplugging, leave the session running and set the maximum current to 0 instead of stopping it.
+- Firmware 448.3251.0Q03197 returns a corrupted ID tag, truncates configuration values, and occasionally sends a malformed connection request. These have been reported to the vendor.
 
 ## [Rolec EVO](https://www.rolecserv.com/ev-products/evo)
 Tested single phase 7kW model (ROLEC5011) with firmware 1.2.7, appears to be working fine.
@@ -128,6 +197,98 @@ but certain features (eg. scheduling) may not work.
 
 ## [Schneider Electric EVlink Wallbox Plus](https://www.se.com/nl/en/product/EVH3S22P0CK/evlink-wallbox-plus-t2-attached-cable-3-phase-32a-22kw/)
 Model is discontinued by the manufacturer.
+
+## Sigenergy Sigen EV DC charger (tested: SIGEN EVDC 25 7.5S2)
+
+Tested on 4 October 2026 with reported vendor `SIGEN`, model `EVDC 25 7.5S2`,
+firmware `V100R001C21SPC117`, one connector, and integration release `v0.12.0`
+(tag commit `848407c`). This is a charging and discharge telemetry report,
+not a claim that all charger functions work. The negotiated OCPP version was
+not independently verified during this test.
+
+### Confirmed observations
+
+- Connector status, transaction ID, session duration, meter start, session
+  energy and stop reason were exposed. Connector history included `Preparing`,
+  `Charging` and `Finishing`.
+- Use `sensor.<cpid>_status_connector` for connector state. The charger-level
+  status was `unknown` while the connector correctly reported `Charging`.
+- After enabling the corresponding integration entities,
+  `Energy.Active.Import.Register` supplied cumulative kWh readings with
+  `Sample.Periodic` context at approximately 60-second intervals during charging.
+
+The following measurands had changing numeric readings in Home Assistant
+history during the 12:08 to 12:18 AEST charging window on 4 October 2026. Each
+carried `Sample.Periodic` context; units below are those displayed by the
+integration, not a claim about the original wire units.
+
+| Measurand | Displayed unit | Observed behaviour |
+| --- | --- | --- |
+| `Energy.Active.Import.Register` | kWh | Cumulative imported energy increased during charging |
+| `Power.Active.Import` | kW | Charging power varied |
+| `Current.Import` | A | Charging current varied |
+| `Voltage` | V | Voltage varied |
+| `SoC` | % | Reported state of charge increased |
+
+`Power.Offered` also had a numeric reading with `Sample.Periodic` context, but
+remained at 25 kW throughout this window. It is not included in the changing
+measurands above, and does not establish that a charging limit can be controlled.
+
+### Vehicle discharge (V2G) observations
+
+In a subsequent vehicle discharge session on 4 October 2026, the tester reported
+the following behaviour on the same setup:
+
+| Measurand or session field | Observed behaviour during discharge |
+| --- | --- |
+| `Power.Active.Import` | Negative power, matching the Sigenergy discharge-power reading within about 1% |
+| `Current.Import` | Remained at 0 A rather than reporting negative current |
+| `Energy.Active.Import.Register` | Remained flat during discharge |
+| Connector status and transaction ID | Connector remained `Charging` with the same transaction ID |
+| Export measurands | No export measurands appeared during the observed discharge session |
+
+The approximately 1% agreement is a comparison reported for this session, not a
+calibrated accuracy specification. These observations show discharge through
+signed `Power.Active.Import`; `Charging` status and the transaction ID alone
+did not distinguish charging from discharge. Zero `Current.Import` did not
+mean that no energy was flowing.
+
+The flat import register did not account for exported energy, and no usable
+export-energy register was demonstrated. Integrating negative power over time
+would be a separate energy estimate, not a charger-reported export register.
+This telemetry observation does not establish OCPP control of V2G or verified
+bidirectional energy accounting.
+
+### Measurand auto-detection limitation
+
+Automatic detection did not identify the supported measurands in this test.
+Do not rely on auto-detection to establish which readings this firmware can
+supply. If using this setup, configure the required measurands manually and
+enable the corresponding Home Assistant entities, then check for live readings
+during a charging session.
+
+Measurand configuration and entity enablement are separate steps: enabling an
+entity alone does not make the charger report that measurement. The numeric
+readings listed above were observed; export and interval-energy reporting were
+not established. This limitation is reported for the tested firmware, not all
+Sigenergy models or firmware versions.
+
+### Limits of this test
+
+- `Energy.Active.Export.Register` was enabled but remained `unknown` in the
+  observed charging window. Import and export interval-energy entities also
+  remained `unknown`. Enabling an entity does not establish that the charger
+  supplies its measurand.
+- The discharge observations above establish negative import-power reporting,
+  not export-energy register support. Zero-valued current and absent export
+  measurands must not be treated as proof that no discharge occurred.
+  Bidirectional energy accounting remains unverified.
+- Features reported `CORE`, and current-limit controls were unavailable at the
+  inspected snapshot. Smart charging, charging-profile enforcement and V2G
+  control were not verified.
+
+See the [test record](https://github.com/purcell-lab/ha-bsv-settlement/issues/61)
+for the dated sensor observations and their limitations.
 
 ## [Simpson & Partners](https://simpson-partners.com/home-ev-charger/)
 All basic functions work properly
