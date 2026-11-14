@@ -152,7 +152,7 @@ NUMBERS: Final = [
         icon="mdi:brightness-6",
         # Standard OCPP key, 0-100 (% of max brightness). Absent from this
         # charger's GetConfiguration dump but confirmed readable and writable
-        # by name -- 30 and 100 both accepted and read back on SL320S647.
+        # by name -- 30 and 100 both accepted and read back on the EVSC7S.
         initial_value=DEFAULT_LIGHT_INTENSITY,
         native_min_value=0,
         native_max_value=100,
@@ -171,7 +171,7 @@ NUMBERS: Final = [
 # writable and reads back correctly, but has no observable effect: the vendor
 # CT clamp DataTransfer arrives every 30s regardless of whether the key is set
 # to 10, 30 or 60, and the interval does not latch when the feature is toggled
-# off and on either (measured on SL320S647 2026-08-10). Exposing a control that
+# off and on either (measured on the EVSC7S 2026-08-10). Exposing a control that
 # silently does nothing is worse than not exposing it. Worth retesting after a
 # charger power-cycle, in case the value only applies at boot.
 REMOVED_NUMBER_KEYS: Final = [
