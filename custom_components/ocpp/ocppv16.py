@@ -192,6 +192,10 @@ class ChargePoint(cp):
         self._tx_indeterminate: set[int] = set()
         # connector_id -> (tx_id, started_at) as persisted before a restart
         self._persisted_tx: dict[int, tuple[int, float]] = {}
+        # connector_id -> (tx_id, meter_start kWh) as persisted before a
+        # restart. Kept apart from _persisted_tx because older stores have no
+        # meter start, and a session without one must still keep its start.
+        self._persisted_meter_start: dict[int, tuple[int, float]] = {}
         # Payloads of StopTransactions that could not be attributed yet, each
         # with the held connectors it could belong to. One is applied only when
         # a settled connector is its sole possible owner; otherwise the final
@@ -277,6 +281,15 @@ class ChargePoint(cp):
             except (KeyError, TypeError, ValueError):
                 continue
             self._note_transaction_id(tx)
+            # Optional: stores written before the meter start was persisted
+            # lack it, and a bad value only costs the energy baseline.
+            try:
+                meter_start = float(item["meter_start"])
+            except (KeyError, TypeError, ValueError):
+                meter_start = None
+            if meter_start is not None and math.isfinite(meter_start):
+                if meter_start >= 0:
+                    self._persisted_meter_start[conn] = (tx, meter_start)
             # NaN and infinities parse as floats but would make every later
             # session-time calculation raise; treat them as no start at all,
             # which leaves the session with an estimated start instead.
@@ -305,19 +318,34 @@ class ChargePoint(cp):
         if 0 < tx <= _TX_ID_CEILING:
             self._last_tx_id = max(self._last_tx_id, tx)
 
+    def _persistable_meter_start(self, connector_id: int) -> float | None:
+        """Return the connector's meter start if it is a usable number."""
+        try:
+            value = float(self._metrics[(connector_id, csess.meter_start)].value)
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) and value >= 0 else None
+
     def _tx_store_snapshot(self) -> dict:
-        """Serialise what a restart needs: the last id and running sessions."""
-        return {
-            "last_tx_id": int(self._last_tx_id),
-            "connectors": {
-                str(conn): {
-                    "tx_id": int(tx),
-                    "started_at": float(self._tx_started_at[conn]),
-                }
-                for conn, tx in self._active_tx.items()
-                if tx and conn in self._tx_started_at
-            },
-        }
+        """Serialise what a restart needs: the last id and running sessions.
+
+        The meter start is kept too: without it a restart re-baselines the
+        session energy on the meter reading at reconnect, and the energy
+        delivered before the restart is lost from the session total.
+        """
+        connectors: dict[str, dict] = {}
+        for conn, tx in self._active_tx.items():
+            if not tx or conn not in self._tx_started_at:
+                continue
+            item: dict = {
+                "tx_id": int(tx),
+                "started_at": float(self._tx_started_at[conn]),
+            }
+            meter_start = self._persistable_meter_start(conn)
+            if meter_start is not None:
+                item["meter_start"] = meter_start
+            connectors[str(conn)] = item
+        return {"last_tx_id": int(self._last_tx_id), "connectors": connectors}
 
     def _schedule_tx_store_save(self) -> None:
         """Persist best-effort: coalesced, and never awaited by a handler."""
@@ -437,7 +465,11 @@ class ChargePoint(cp):
         # negative or the raw register.
         if session_kwh < 0:
             return
-        self._metrics[(connector_id, csess.session_energy)].value = session_kwh
+        # Wh to kWh by float subtraction leaves artefacts such as
+        # 0.206999999999994; the meter resolves 1 Wh, so round to that.
+        self._metrics[(connector_id, csess.session_energy)].value = round(
+            session_kwh, 3
+        )
 
     def _forget_stop_candidate(self, connector_id: int) -> None:
         """Record that this connector can no longer own any pending stop.
@@ -1694,6 +1726,27 @@ class ChargePoint(cp):
         ms_key = (connector_id, csess.meter_start)
         tx_key = (connector_id, csess.transaction_id)
         session_key = (connector_id, csess.session_time)
+
+        persisted_ms = self._persisted_meter_start.get(connector_id)
+        if (
+            self._metrics[ms_key].value is None
+            and persisted_ms is not None
+            and transaction_id
+            and not tx_end_context
+            and persisted_ms[0] == transaction_id
+        ):
+            # The session that was running before the restart: its meter
+            # start was persisted, so the energy baseline survives. HA's own
+            # sensor cannot be used here, as it is unavailable during a reload.
+            self._metrics[ms_key].value = persisted_ms[1]
+            self._metrics[ms_key].unit = HA_ENERGY_UNIT
+            _LOGGER.debug(
+                "%s[%s] restored value=%s for transactionId=%s from storage.",
+                csess.meter_start,
+                connector_id,
+                persisted_ms[1],
+                transaction_id,
+            )
 
         if self._metrics[ms_key].value is None:
             value = self.get_ha_metric(csess.meter_start, connector_id)

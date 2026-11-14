@@ -185,10 +185,10 @@ async def test_running_session_is_persisted_for_a_restart(
     await _settle(hass, cp)
     key = cp._tx_store.key
 
-    tx = cp.on_start_transaction(1, "tag", 0).transaction_id
+    tx = cp.on_start_transaction(1, "tag", 959411).transaction_id
     assert cp._tx_store_snapshot() == {
         "last_tx_id": tx,
-        "connectors": {"1": {"tx_id": tx, "started_at": NOW}},
+        "connectors": {"1": {"tx_id": tx, "started_at": NOW, "meter_start": 959.411}},
     }
     # Nothing is written synchronously from the handler.
     assert key not in hass_storage
@@ -1369,3 +1369,129 @@ async def test_station_meter_values_ignore_a_session_id(hass, frozen_time):
 
     assert cp._tx_indeterminate == set()
     assert cp._active_tx == {1: 0, 0: 0}
+
+
+# --------------------------------------------------------------------------
+# Session energy across a restart (BG Sync fork)
+# --------------------------------------------------------------------------
+
+
+def _store_with_session(key: str, item: dict) -> dict:
+    return {
+        "version": 1,
+        "key": key,
+        "data": {"last_tx_id": 4242, "connectors": {"1": item}},
+    }
+
+
+async def test_restart_keeps_the_session_energy_baseline(
+    hass, hass_storage, frozen_time
+):
+    """A restart mid-session must not re-baseline the session energy.
+
+    Measured on an EVSC7S: a session started at 959.411 kWh read 0.406 kWh
+    at its end after a reload, instead of the 1.497 kWh it delivered,
+    because the meter start was taken from the reading at reconnect.
+    """
+    entry = _mk_entry(hass)
+    key = _store_key(entry)
+    hass_storage[key] = _store_with_session(
+        key, {"tx_id": 4242, "started_at": NOW - 1800, "meter_start": 959.411}
+    )
+    cp = _mk_cp(hass, entry=entry)
+    await _settle(hass, cp)
+
+    cp.on_meter_values(**_meter_values(4242, value="960511"))
+    await hass.async_block_till_done()
+
+    assert cp._metrics[(1, csess.meter_start)].value == 959.411
+    assert cp._metrics[(1, csess.session_energy)].value == 1.1
+    assert cp._metrics[(1, csess.session_time)].value == 30
+
+    cp.on_stop_transaction(meter_stop=960908, timestamp=None, transaction_id=4242)
+    await hass.async_block_till_done()
+    assert cp._metrics[(1, csess.session_energy)].value == 1.497
+
+
+async def test_restored_meter_start_is_persisted_again(hass, hass_storage, frozen_time):
+    """A second restart in the same session keeps the original baseline."""
+    entry = _mk_entry(hass)
+    key = _store_key(entry)
+    hass_storage[key] = _store_with_session(
+        key, {"tx_id": 4242, "started_at": NOW - 1800, "meter_start": 959.411}
+    )
+    cp = _mk_cp(hass, entry=entry)
+    await _settle(hass, cp)
+
+    cp.on_meter_values(**_meter_values(4242, value="960511"))
+    await hass.async_block_till_done()
+
+    assert cp._tx_store_snapshot()["connectors"]["1"]["meter_start"] == 959.411
+
+
+async def test_store_without_meter_start_still_restores_the_session(
+    hass, hass_storage, frozen_time
+):
+    """Stores from older versions have no meter start; the session survives."""
+    entry = _mk_entry(hass)
+    key = _store_key(entry)
+    hass_storage[key] = _store_with_session(
+        key, {"tx_id": 4242, "started_at": NOW - 1800}
+    )
+    cp = _mk_cp(hass, entry=entry)
+    await _settle(hass, cp)
+
+    cp.on_meter_values(**_meter_values(4242, value="960511"))
+    await hass.async_block_till_done()
+
+    assert cp._persisted_meter_start == {}
+    assert cp._metrics[(1, csess.session_time)].value == 30
+    # Old behaviour: the baseline falls back to the reading at reconnect.
+    assert cp._metrics[(1, csess.meter_start)].value == 960.511
+
+
+async def test_persisted_meter_start_of_another_transaction_is_ignored(
+    hass, hass_storage, frozen_time
+):
+    """A baseline belongs to its own transaction only."""
+    entry = _mk_entry(hass)
+    key = _store_key(entry)
+    hass_storage[key] = _store_with_session(
+        key, {"tx_id": 4242, "started_at": NOW - 1800, "meter_start": 959.411}
+    )
+    cp = _mk_cp(hass, entry=entry)
+    await _settle(hass, cp)
+
+    cp.on_meter_values(**_meter_values(5555, value="960511"))
+    await hass.async_block_till_done()
+
+    assert cp._metrics[(1, csess.meter_start)].value == 960.511
+
+
+@pytest.mark.parametrize("bad", ["abc", None, -1.0, float("nan"), float("inf")])
+async def test_unusable_persisted_meter_start_is_ignored(
+    hass, hass_storage, frozen_time, bad
+):
+    """A bad meter start costs only the baseline, never the session."""
+    entry = _mk_entry(hass)
+    key = _store_key(entry)
+    hass_storage[key] = _store_with_session(
+        key, {"tx_id": 4242, "started_at": NOW - 1800, "meter_start": bad}
+    )
+    cp = _mk_cp(hass, entry=entry)
+    await _settle(hass, cp)
+
+    assert cp._persisted_meter_start == {}
+    assert cp._persisted_tx == {1: (4242, NOW - 1800)}
+
+
+async def test_stop_energy_is_rounded_to_the_meter_resolution(hass, frozen_time):
+    """Wh to kWh float artefacts must not reach the sensor."""
+    cp = _mk_cp(hass)
+    await _settle(hass, cp)
+    tx = cp.on_start_transaction(1, "tag", 960917).transaction_id
+
+    cp.on_stop_transaction(meter_stop=961124, timestamp=None, transaction_id=tx)
+    await hass.async_block_till_done()
+
+    assert cp._metrics[(1, csess.session_energy)].value == 0.207
