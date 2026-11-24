@@ -6,7 +6,7 @@ from collections.abc import AsyncGenerator
 from copy import deepcopy
 
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import device_registry
+from homeassistant.helpers import device_registry, issue_registry as ir
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.ocpp import (
@@ -76,6 +76,10 @@ async def test_setup_unload_and_reload_entry(
     # Structural: the forward actually registered every entity platform.
     assert_platforms_hold(hass, config_entry.entry_id)
     entity_before = live_entity(hass, MAX_CURRENT_EID, "number")
+    # Final release on this domain: the move notice is raised in Repairs.
+    issue = ir.async_get(hass).async_get_issue(DOMAIN, "moved_to_sync_energy_ocpp")
+    assert issue is not None
+    assert issue.learn_more_url.endswith("/MIGRATION.md")
 
     # Reload the entry and assert that the data from above is still there
     assert await hass.config_entries.async_reload(config_entry.entry_id)

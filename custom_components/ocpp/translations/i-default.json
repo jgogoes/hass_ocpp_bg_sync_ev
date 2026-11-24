@@ -198,5 +198,11 @@
         "abort": {
             "no_charge_points": "No charge point has connected to this central system yet, so there is nothing to configure."
         }
+    },
+    "issues": {
+        "moved_to_sync_energy_ocpp": {
+            "title": "OCPP - BG Sync EV has moved to a new name",
+            "description": "This is the last release of \"OCPP - BG Sync EV\" on the `ocpp` domain. The project continues as **OCPP for Sync Energy chargers** (domain `sync_energy_ocpp`), so it can be listed in the Home Assistant Marketplace.\n\nVersion 2.0.0 adds automatic Sync charger detection with no file edits, shows only the controls your charger supports, and adds one-click diagnostics. A guided import keeps your settings and entity IDs.\n\nSelect **Learn more** for the migration steps."
+        }
     }
 }

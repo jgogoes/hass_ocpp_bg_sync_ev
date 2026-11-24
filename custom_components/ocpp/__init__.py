@@ -13,7 +13,7 @@ from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.util import slugify
 from homeassistant.helpers.typing import ConfigType
-from homeassistant.helpers import device_registry
+from homeassistant.helpers import device_registry, issue_registry as ir
 import homeassistant.helpers.config_validation as cv
 import voluptuous as vol
 
@@ -295,6 +295,20 @@ def _register_domain_services(hass: HomeAssistant) -> list[str]:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     """Set up this integration from config entry."""
+    # BG Sync fork, final release on this domain: the project continues as
+    # "sync_energy_ocpp". Tell the user once, in Settings > Repairs.
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        "moved_to_sync_energy_ocpp",
+        is_fixable=False,
+        is_persistent=False,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="moved_to_sync_energy_ocpp",
+        learn_more_url=(
+            "https://github.com/jgogoes/hass_ocpp_bg_sync_ev/blob/main/MIGRATION.md"
+        ),
+    )
     if hass.data.get(DOMAIN) is None:
         hass.data.setdefault(DOMAIN, {})
         _LOGGER.info(entry.data)
