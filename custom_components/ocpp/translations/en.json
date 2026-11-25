@@ -201,8 +201,8 @@
     },
     "issues": {
         "moved_to_sync_energy_ocpp": {
-            "title": "OCPP - BG Sync EV has moved to a new name",
-            "description": "This is the last release of \"OCPP - BG Sync EV\" on the `ocpp` domain. The project continues as **OCPP for Sync Energy chargers** (domain `sync_energy_ocpp`), so it can be listed in the Home Assistant Marketplace.\n\nVersion 2.0.0 adds automatic Sync charger detection with no file edits, shows only the controls your charger supports, and adds one-click diagnostics. A guided import keeps your settings and entity IDs.\n\nSelect **Learn more** for the migration steps."
+            "title": "OCPP - BG Sync EV has moved to a new integration",
+            "description": "This is the last release of \"OCPP - BG Sync EV\". The project continues as **OCPP for Sync Energy chargers** (domain `sync_energy_ocpp`) in a new repository: https://github.com/jgogoes/sync_energy_ocpp. The new domain lets it be listed in the Home Assistant Marketplace.\n\nVersion 2.0.0 recognises Sync chargers automatically with no file edits, shows only the controls your charger supports, and adds one-click diagnostics. A guided import keeps your settings and entity IDs.\n\nYou install it next to this integration and keep this one until the new one works. Do **not** use \"Delete and uninstall\" on this integration first: the import needs its setup. Select **Learn more** for the steps."
         }
     }
 }

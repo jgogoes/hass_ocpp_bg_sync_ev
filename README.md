@@ -2,11 +2,14 @@
 
 # OCPP - BG Sync EV
 
-> **This project has a new name.** From version 2.0.0 it is **OCPP for
-> Sync Energy chargers** with the domain `sync_energy_ocpp`, so it can be
-> listed in the Home Assistant Marketplace. Version 1.2.0 is the last release
-> on the `ocpp` domain. See [MIGRATION.md](https://github.com/jgogoes/hass_ocpp_bg_sync_ev/blob/main/MIGRATION.md)
-> to move across with your settings and entity IDs.
+> **This project has moved.** From version 2.0.0 it is **OCPP for Sync
+> Energy chargers**, domain `sync_energy_ocpp`, in a new repository:
+> [jgogoes/sync_energy_ocpp](https://github.com/jgogoes/sync_energy_ocpp).
+> The new domain lets it be listed in the Home Assistant Marketplace.
+> Version 1.2.0 is the last release here. Install the new one next to this
+> one and follow its [MIGRATION.md](https://github.com/jgogoes/sync_energy_ocpp/blob/main/MIGRATION.md):
+> a guided import keeps your settings and entity IDs. Do not use "Delete and
+> uninstall" on this integration first.
 
 A Home Assistant integration for EV chargers speaking OCPP, **forked for
 BG SyncEV / Sync Energy chargers**.

@@ -306,7 +306,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         severity=ir.IssueSeverity.WARNING,
         translation_key="moved_to_sync_energy_ocpp",
         learn_more_url=(
-            "https://github.com/jgogoes/hass_ocpp_bg_sync_ev/blob/main/MIGRATION.md"
+            "https://github.com/jgogoes/sync_energy_ocpp/blob/main/MIGRATION.md"
         ),
     )
     if hass.data.get(DOMAIN) is None:
